@@ -55,13 +55,16 @@ pub fn create_model_provider(
     provider_info: ModelProviderInfo,
     auth_manager: Option<Arc<AuthManager>>,
 ) -> SharedModelProvider {
-    if provider_info.is_amazon_bedrock() {
+    if provider_info.is_amazon_bedrock() || provider_info.is_amazon_bedrock_claude() {
         let aws = provider_info
             .aws
             .clone()
             .unwrap_or(ModelProviderAwsAuthInfo {
                 profile: None,
                 region: None,
+                access_key_id: None,
+                secret_access_key: None,
+                session_token: None,
             });
         return Arc::new(AmazonBedrockModelProvider {
             info: provider_info,

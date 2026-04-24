@@ -37,6 +37,13 @@ pub const OPENAI_PROVIDER_ID: &str = "openai";
 const AMAZON_BEDROCK_PROVIDER_NAME: &str = "Amazon Bedrock";
 pub const AMAZON_BEDROCK_PROVIDER_ID: &str = "amazon-bedrock";
 pub const AMAZON_BEDROCK_DEFAULT_BASE_URL: &str = "https://bedrock-mantle.us-east-1.api.aws/v1";
+const AMAZON_BEDROCK_CLAUDE_PROVIDER_NAME: &str = "Amazon Bedrock Claude";
+pub const AMAZON_BEDROCK_CLAUDE_PROVIDER_ID: &str = "amazon-bedrock-claude";
+pub const AMAZON_BEDROCK_CLAUDE_DEFAULT_BASE_URL: &str =
+    "https://bedrock-runtime.us-east-1.amazonaws.com";
+const GOOGLE_GEMINI_PROVIDER_NAME: &str = "Google Gemini";
+pub const GOOGLE_GEMINI_PROVIDER_ID: &str = "google-gemini";
+pub const GOOGLE_GEMINI_DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 const CHAT_WIRE_API_REMOVED_ERROR: &str = "`wire_api = \"chat\"` is no longer supported.\nHow to fix: set `wire_api = \"responses\"` in your provider config.\nMore info: https://github.com/openai/codex/discussions/7782";
 pub const LEGACY_OLLAMA_CHAT_PROVIDER_ID: &str = "ollama-chat";
 pub const OLLAMA_CHAT_PROVIDER_REMOVED_ERROR: &str = "`ollama-chat` is no longer supported.\nHow to fix: replace `ollama-chat` with `ollama` in `model_provider`, `oss_provider`, or `--local-provider`.\nMore info: https://github.com/openai/codex/discussions/7782";
@@ -138,6 +145,12 @@ pub struct ModelProviderAwsAuthInfo {
     pub profile: Option<String>,
     /// AWS region to use for provider-specific endpoints.
     pub region: Option<String>,
+    /// Static AWS access key ID to use for this provider.
+    pub access_key_id: Option<String>,
+    /// Static AWS secret access key to use for this provider.
+    pub secret_access_key: Option<String>,
+    /// Optional AWS session token to use with static credentials.
+    pub session_token: Option<String>,
 }
 
 impl ModelProviderInfo {
@@ -360,11 +373,70 @@ impl ModelProviderInfo {
             aws: Some(aws.unwrap_or(ModelProviderAwsAuthInfo {
                 profile: None,
                 region: None,
+                access_key_id: None,
+                secret_access_key: None,
+                session_token: None,
             })),
             wire_api: WireApi::Responses,
             query_params: None,
             http_headers: None,
             env_http_headers: None,
+            request_max_retries: None,
+            stream_max_retries: None,
+            stream_idle_timeout_ms: None,
+            websocket_connect_timeout_ms: None,
+            requires_openai_auth: false,
+            supports_websockets: false,
+        }
+    }
+
+    pub fn create_amazon_bedrock_claude_provider(
+        aws: Option<ModelProviderAwsAuthInfo>,
+    ) -> ModelProviderInfo {
+        ModelProviderInfo {
+            name: AMAZON_BEDROCK_CLAUDE_PROVIDER_NAME.into(),
+            base_url: Some(AMAZON_BEDROCK_CLAUDE_DEFAULT_BASE_URL.into()),
+            env_key: None,
+            env_key_instructions: None,
+            experimental_bearer_token: None,
+            auth: None,
+            aws: Some(aws.unwrap_or(ModelProviderAwsAuthInfo {
+                profile: None,
+                region: None,
+                access_key_id: None,
+                secret_access_key: None,
+                session_token: None,
+            })),
+            wire_api: WireApi::Responses,
+            query_params: None,
+            http_headers: None,
+            env_http_headers: None,
+            request_max_retries: None,
+            stream_max_retries: None,
+            stream_idle_timeout_ms: None,
+            websocket_connect_timeout_ms: None,
+            requires_openai_auth: false,
+            supports_websockets: false,
+        }
+    }
+
+    pub fn create_google_gemini_provider() -> ModelProviderInfo {
+        ModelProviderInfo {
+            name: GOOGLE_GEMINI_PROVIDER_NAME.into(),
+            base_url: Some(GOOGLE_GEMINI_DEFAULT_BASE_URL.into()),
+            env_key: None,
+            env_key_instructions: None,
+            experimental_bearer_token: None,
+            auth: None,
+            aws: None,
+            wire_api: WireApi::Responses,
+            query_params: None,
+            http_headers: None,
+            env_http_headers: Some(
+                [("x-goog-api-key".to_string(), "GEMINI_API_KEY".to_string())]
+                    .into_iter()
+                    .collect(),
+            ),
             request_max_retries: None,
             stream_max_retries: None,
             stream_idle_timeout_ms: None,
@@ -380,6 +452,14 @@ impl ModelProviderInfo {
 
     pub fn is_amazon_bedrock(&self) -> bool {
         self.name == AMAZON_BEDROCK_PROVIDER_NAME
+    }
+
+    pub fn is_amazon_bedrock_claude(&self) -> bool {
+        self.name == AMAZON_BEDROCK_CLAUDE_PROVIDER_NAME
+    }
+
+    pub fn is_google_gemini(&self) -> bool {
+        self.name == GOOGLE_GEMINI_PROVIDER_NAME
     }
 
     pub fn supports_remote_compaction(&self) -> bool {
@@ -404,6 +484,9 @@ pub fn built_in_model_providers(
     use ModelProviderInfo as P;
     let openai_provider = P::create_openai_provider(openai_base_url);
     let amazon_bedrock_provider = P::create_amazon_bedrock_provider(/*aws*/ None);
+    let amazon_bedrock_claude_provider =
+        P::create_amazon_bedrock_claude_provider(/*aws*/ None);
+    let google_gemini_provider = P::create_google_gemini_provider();
 
     // We do not want to be in the business of adjucating which third-party
     // providers are bundled with Codex CLI, so we only include the OpenAI and
@@ -412,6 +495,11 @@ pub fn built_in_model_providers(
     [
         (OPENAI_PROVIDER_ID, openai_provider),
         (AMAZON_BEDROCK_PROVIDER_ID, amazon_bedrock_provider),
+        (
+            AMAZON_BEDROCK_CLAUDE_PROVIDER_ID,
+            amazon_bedrock_claude_provider,
+        ),
+        (GOOGLE_GEMINI_PROVIDER_ID, google_gemini_provider),
         (
             OLLAMA_OSS_PROVIDER_ID,
             create_oss_provider(DEFAULT_OLLAMA_PORT, WireApi::Responses),
@@ -430,23 +518,24 @@ pub fn built_in_model_providers(
 ///
 /// Configured providers extend the built-in set. Built-in providers are not
 /// generally overridable, but the built-in Amazon Bedrock provider allows the
-/// user to set `aws.profile` and `aws.region`.
+/// user to set AWS credentials and routing fields.
 pub fn merge_configured_model_providers(
     mut model_providers: HashMap<String, ModelProviderInfo>,
     configured_model_providers: HashMap<String, ModelProviderInfo>,
 ) -> Result<HashMap<String, ModelProviderInfo>, String> {
     for (key, mut provider) in configured_model_providers {
-        if key == AMAZON_BEDROCK_PROVIDER_ID {
+        if key == AMAZON_BEDROCK_PROVIDER_ID || key == AMAZON_BEDROCK_CLAUDE_PROVIDER_ID {
             let aws_override = provider.aws.take();
             if provider != ModelProviderInfo::default() {
                 return Err(format!(
-                    "model_providers.{AMAZON_BEDROCK_PROVIDER_ID} only supports changing \
-`aws.profile` and `aws.region`; other non-default provider fields are not supported"
+                    "model_providers.{key} only supports changing `aws.profile`, \
+`aws.region`, `aws.access_key_id`, `aws.secret_access_key`, and \
+`aws.session_token`; other non-default provider fields are not supported"
                 ));
             }
 
             if let Some(aws_override) = aws_override
-                && let Some(built_in_provider) = model_providers.get_mut(AMAZON_BEDROCK_PROVIDER_ID)
+                && let Some(built_in_provider) = model_providers.get_mut(&key)
                 && let Some(built_in_aws) = built_in_provider.aws.as_mut()
             {
                 if let Some(profile) = aws_override.profile {
@@ -454,6 +543,15 @@ pub fn merge_configured_model_providers(
                 }
                 if let Some(region) = aws_override.region {
                     built_in_aws.region = Some(region);
+                }
+                if let Some(access_key_id) = aws_override.access_key_id {
+                    built_in_aws.access_key_id = Some(access_key_id);
+                }
+                if let Some(secret_access_key) = aws_override.secret_access_key {
+                    built_in_aws.secret_access_key = Some(secret_access_key);
+                }
+                if let Some(session_token) = aws_override.session_token {
+                    built_in_aws.session_token = Some(session_token);
                 }
             }
         } else {

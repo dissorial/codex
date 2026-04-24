@@ -141,6 +141,9 @@ use serde::Deserialize;
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::Duration as StdDuration;
 
 mod guardian_tests;
@@ -2618,6 +2621,154 @@ async fn attach_thread_persistence(session: &mut Session) -> PathBuf {
         .await
         .expect("load rollout path")
         .expect("thread should have rollout path")
+}
+
+#[derive(Default)]
+struct CountingThreadStore {
+    shutdown: AtomicBool,
+    append_after_shutdown: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl codex_thread_store::ThreadStore for CountingThreadStore {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    async fn create_thread(
+        &self,
+        _params: codex_thread_store::CreateThreadParams,
+    ) -> codex_thread_store::ThreadStoreResult<()> {
+        Ok(())
+    }
+
+    async fn resume_thread(
+        &self,
+        _params: codex_thread_store::ResumeThreadParams,
+    ) -> codex_thread_store::ThreadStoreResult<()> {
+        Ok(())
+    }
+
+    async fn append_items(
+        &self,
+        params: codex_thread_store::AppendThreadItemsParams,
+    ) -> codex_thread_store::ThreadStoreResult<()> {
+        if self.shutdown.load(Ordering::SeqCst) {
+            self.append_after_shutdown.fetch_add(1, Ordering::SeqCst);
+            return Err(codex_thread_store::ThreadStoreError::ThreadNotFound {
+                thread_id: params.thread_id,
+            });
+        }
+        Ok(())
+    }
+
+    async fn persist_thread(
+        &self,
+        _thread_id: ThreadId,
+    ) -> codex_thread_store::ThreadStoreResult<()> {
+        Ok(())
+    }
+
+    async fn flush_thread(
+        &self,
+        _thread_id: ThreadId,
+    ) -> codex_thread_store::ThreadStoreResult<()> {
+        Ok(())
+    }
+
+    async fn shutdown_thread(
+        &self,
+        _thread_id: ThreadId,
+    ) -> codex_thread_store::ThreadStoreResult<()> {
+        self.shutdown.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn discard_thread(
+        &self,
+        _thread_id: ThreadId,
+    ) -> codex_thread_store::ThreadStoreResult<()> {
+        Ok(())
+    }
+
+    async fn load_history(
+        &self,
+        _params: codex_thread_store::LoadThreadHistoryParams,
+    ) -> codex_thread_store::ThreadStoreResult<codex_thread_store::StoredThreadHistory> {
+        unimplemented!("not needed for shutdown persistence regression test")
+    }
+
+    async fn read_thread(
+        &self,
+        _params: codex_thread_store::ReadThreadParams,
+    ) -> codex_thread_store::ThreadStoreResult<codex_thread_store::StoredThread> {
+        unimplemented!("not needed for shutdown persistence regression test")
+    }
+
+    async fn list_threads(
+        &self,
+        _params: codex_thread_store::ListThreadsParams,
+    ) -> codex_thread_store::ThreadStoreResult<codex_thread_store::ThreadPage> {
+        unimplemented!("not needed for shutdown persistence regression test")
+    }
+
+    async fn update_thread_metadata(
+        &self,
+        _params: codex_thread_store::UpdateThreadMetadataParams,
+    ) -> codex_thread_store::ThreadStoreResult<codex_thread_store::StoredThread> {
+        unimplemented!("not needed for shutdown persistence regression test")
+    }
+
+    async fn archive_thread(
+        &self,
+        _params: codex_thread_store::ArchiveThreadParams,
+    ) -> codex_thread_store::ThreadStoreResult<()> {
+        unimplemented!("not needed for shutdown persistence regression test")
+    }
+
+    async fn unarchive_thread(
+        &self,
+        _params: codex_thread_store::ArchiveThreadParams,
+    ) -> codex_thread_store::ThreadStoreResult<codex_thread_store::StoredThread> {
+        unimplemented!("not needed for shutdown persistence regression test")
+    }
+}
+
+#[tokio::test]
+async fn shutdown_complete_is_delivered_after_thread_persistence_shutdown_without_appending() {
+    let (session, _turn_context, rx_event) = make_session_and_context_with_rx().await;
+    let store = Arc::new(CountingThreadStore::default());
+    let live_thread = LiveThread::create(
+        store.clone(),
+        CreateThreadParams {
+            thread_id: session.conversation_id,
+            forked_from_id: None,
+            source: SessionSource::Exec,
+            base_instructions: BaseInstructions::default(),
+            dynamic_tools: Vec::new(),
+            event_persistence_mode: ThreadEventPersistenceMode::Limited,
+        },
+    )
+    .await
+    .expect("create counting thread persistence");
+    // The test helper returns an Arc<Session>; mutating this field is safe before
+    // any cloned Arc exists outside this scope.
+    let mut session = match Arc::try_unwrap(session) {
+        Ok(session) => session,
+        Err(_) => panic!("sole session owner"),
+    };
+    session.services.live_thread = Some(live_thread);
+    let session = Arc::new(session);
+
+    assert!(super::handlers::shutdown(&session, "shutdown-test".to_string()).await);
+
+    let event = rx_event.recv().await.expect("shutdown event");
+    assert!(matches!(event.msg, EventMsg::ShutdownComplete));
+    assert_eq!(
+        store.append_after_shutdown.load(Ordering::SeqCst),
+        0,
+        "ShutdownComplete must not append to rollout after the live writer is closed"
+    );
 }
 
 fn text_block(s: &str) -> serde_json::Value {

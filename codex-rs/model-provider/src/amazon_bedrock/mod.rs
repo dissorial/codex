@@ -1,5 +1,6 @@
 mod auth;
 mod mantle;
+mod runtime;
 
 use std::sync::Arc;
 
@@ -40,12 +41,16 @@ impl ModelProvider for AmazonBedrockModelProvider {
     async fn api_provider(&self) -> Result<Provider> {
         let region = resolve_region(&self.aws).await?;
         let mut api_provider_info = self.info.clone();
-        api_provider_info.base_url = Some(base_url(&region)?);
+        api_provider_info.base_url = Some(if self.info.is_amazon_bedrock_claude() {
+            runtime::base_url(&region)
+        } else {
+            base_url(&region)?
+        });
         api_provider_info.to_api_provider(/*auth_mode*/ None)
     }
 
     async fn api_auth(&self) -> Result<SharedAuthProvider> {
-        resolve_provider_auth(&self.aws).await
+        resolve_provider_auth(&self.info, &self.aws).await
     }
 }
 

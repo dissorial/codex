@@ -4,6 +4,8 @@ use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelInstructionsVariables;
 use codex_protocol::openai_models::ModelMessages;
 use codex_protocol::openai_models::ModelVisibility;
+use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::openai_models::ReasoningEffortPreset;
 use codex_protocol::openai_models::TruncationMode;
 use codex_protocol::openai_models::TruncationPolicyConfig;
 use codex_protocol::openai_models::WebSearchToolType;
@@ -64,6 +66,13 @@ pub fn with_config_overrides(mut model: ModelInfo, config: &ModelsManagerConfig)
 
 /// Build a minimal fallback model descriptor for missing/unknown slugs.
 pub fn model_info_from_slug(slug: &str) -> ModelInfo {
+    if is_bedrock_claude_opus_46_slug(slug) {
+        return bedrock_claude_opus_46_model_info(slug);
+    }
+    if is_gemini_31_pro_slug(slug) {
+        return gemini_31_pro_model_info(slug);
+    }
+
     warn!("Unknown model {slug} is used. This will use fallback model metadata.");
     ModelInfo {
         slug: slug.to_string(),
@@ -96,6 +105,110 @@ pub fn model_info_from_slug(slug: &str) -> ModelInfo {
         experimental_supported_tools: Vec::new(),
         input_modalities: default_input_modalities(),
         used_fallback_model_metadata: true, // this is the fallback model metadata
+        supports_search_tool: false,
+    }
+}
+
+fn is_gemini_31_pro_slug(slug: &str) -> bool {
+    matches!(
+        slug,
+        "gemini-3.1-pro-preview" | "gemini-3.1-pro-preview-customtools"
+    )
+}
+
+fn gemini_31_pro_model_info(slug: &str) -> ModelInfo {
+    ModelInfo {
+        slug: slug.to_string(),
+        display_name: if slug.ends_with("-customtools") {
+            "Gemini 3.1 Pro Preview Custom Tools".to_string()
+        } else {
+            "Gemini 3.1 Pro Preview".to_string()
+        },
+        description: Some("Google Gemini 3.1 Pro Preview through the Gemini API.".to_string()),
+        default_reasoning_level: Some(ReasoningEffort::High),
+        supported_reasoning_levels: vec![
+            reasoning_preset(ReasoningEffort::Minimal, "minimal"),
+            reasoning_preset(ReasoningEffort::Low, "low"),
+            reasoning_preset(ReasoningEffort::Medium, "medium"),
+            reasoning_preset(ReasoningEffort::High, "high"),
+        ],
+        shell_type: ConfigShellToolType::Default,
+        visibility: ModelVisibility::List,
+        supported_in_api: true,
+        priority: 97,
+        additional_speed_tiers: Vec::new(),
+        availability_nux: None,
+        upgrade: None,
+        base_instructions: BASE_INSTRUCTIONS.to_string(),
+        model_messages: local_personality_messages_for_slug("gpt-5.2-codex"),
+        supports_reasoning_summaries: false,
+        default_reasoning_summary: ReasoningSummary::None,
+        support_verbosity: false,
+        default_verbosity: None,
+        apply_patch_tool_type: None,
+        web_search_tool_type: WebSearchToolType::Text,
+        truncation_policy: TruncationPolicyConfig::bytes(/*limit*/ 10_000),
+        supports_parallel_tool_calls: true,
+        supports_image_detail_original: true,
+        context_window: Some(1_048_576),
+        max_context_window: Some(1_048_576),
+        auto_compact_token_limit: Some(940_000),
+        effective_context_window_percent: 90,
+        experimental_supported_tools: Vec::new(),
+        input_modalities: default_input_modalities(),
+        used_fallback_model_metadata: false,
+        supports_search_tool: false,
+    }
+}
+
+fn reasoning_preset(effort: ReasoningEffort, description: &str) -> ReasoningEffortPreset {
+    ReasoningEffortPreset {
+        effort,
+        description: description.to_string(),
+    }
+}
+
+fn is_bedrock_claude_opus_46_slug(slug: &str) -> bool {
+    matches!(
+        slug,
+        "global.anthropic.claude-opus-4-6-v1"
+            | "us.anthropic.claude-opus-4-6-v1"
+            | "anthropic.claude-opus-4-6-v1"
+    )
+}
+
+fn bedrock_claude_opus_46_model_info(slug: &str) -> ModelInfo {
+    ModelInfo {
+        slug: slug.to_string(),
+        display_name: "Claude Opus 4.6 (Bedrock)".to_string(),
+        description: Some("Anthropic Claude Opus 4.6 through Amazon Bedrock.".to_string()),
+        default_reasoning_level: None,
+        supported_reasoning_levels: Vec::new(),
+        shell_type: ConfigShellToolType::Default,
+        visibility: ModelVisibility::List,
+        supported_in_api: true,
+        priority: 98,
+        additional_speed_tiers: Vec::new(),
+        availability_nux: None,
+        upgrade: None,
+        base_instructions: BASE_INSTRUCTIONS.to_string(),
+        model_messages: local_personality_messages_for_slug("gpt-5.2-codex"),
+        supports_reasoning_summaries: false,
+        default_reasoning_summary: ReasoningSummary::None,
+        support_verbosity: false,
+        default_verbosity: None,
+        apply_patch_tool_type: None,
+        web_search_tool_type: WebSearchToolType::Text,
+        truncation_policy: TruncationPolicyConfig::bytes(/*limit*/ 10_000),
+        supports_parallel_tool_calls: true,
+        supports_image_detail_original: true,
+        context_window: Some(1_000_000),
+        max_context_window: Some(1_000_000),
+        auto_compact_token_limit: Some(900_000),
+        effective_context_window_percent: 90,
+        experimental_supported_tools: Vec::new(),
+        input_modalities: default_input_modalities(),
+        used_fallback_model_metadata: false,
         supports_search_tool: false,
     }
 }

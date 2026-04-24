@@ -68,6 +68,8 @@ coverage/
 
 # personal files
 personal/
+.codex-bedrock/
+.codex-gemini/
 
 # os
 .DS_Store
@@ -91,4 +93,3 @@ CHANGELOG.ignore.md
 # Python bytecode files
 __pycache__/
 *.pyc
-

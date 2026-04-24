@@ -10,6 +10,7 @@ use codex_client::Request;
 use codex_client::RequestBody;
 use codex_client::RequestCompression;
 use codex_model_provider_info::ModelProviderAwsAuthInfo;
+use codex_model_provider_info::ModelProviderInfo;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result;
 use http::HeaderMap;
@@ -21,19 +22,26 @@ use super::mantle::region_from_config;
 
 const AWS_BEARER_TOKEN_BEDROCK_ENV_VAR: &str = "AWS_BEARER_TOKEN_BEDROCK";
 const LEGACY_SESSION_ID_HEADER: &str = "session_id";
+const BEDROCK_RUNTIME_SERVICE_NAME: &str = "bedrock";
 
 enum BedrockAuthMethod {
-    EnvBearerToken { token: String, region: String },
+    EnvBearerToken { token: String },
     AwsSdkAuth { context: AwsAuthContext },
 }
 
-async fn resolve_auth_method(aws: &ModelProviderAwsAuthInfo) -> Result<BedrockAuthMethod> {
+async fn resolve_auth_method(
+    provider_info: &ModelProviderInfo,
+    aws: &ModelProviderAwsAuthInfo,
+) -> Result<BedrockAuthMethod> {
     if let Some(token) = bearer_token_from_env() {
-        let region = bearer_token_region_from_config(aws)?;
-        return Ok(BedrockAuthMethod::EnvBearerToken { token, region });
+        let _ = bearer_token_region_from_config(aws)?;
+        return Ok(BedrockAuthMethod::EnvBearerToken { token });
     }
 
-    let config = aws_auth_config(aws);
+    let mut config = aws_auth_config(aws);
+    if provider_info.is_amazon_bedrock_claude() {
+        config.service = BEDROCK_RUNTIME_SERVICE_NAME.to_string();
+    }
     let context = AwsAuthContext::load(config)
         .await
         .map_err(aws_auth_error_to_codex_error)?;
@@ -41,10 +49,11 @@ async fn resolve_auth_method(aws: &ModelProviderAwsAuthInfo) -> Result<BedrockAu
 }
 
 pub(super) async fn resolve_provider_auth(
+    provider_info: &ModelProviderInfo,
     aws: &ModelProviderAwsAuthInfo,
 ) -> Result<SharedAuthProvider> {
-    match resolve_auth_method(aws).await? {
-        BedrockAuthMethod::EnvBearerToken { token, .. } => Ok(Arc::new(BearerAuthProvider {
+    match resolve_auth_method(provider_info, aws).await? {
+        BedrockAuthMethod::EnvBearerToken { token } => Ok(Arc::new(BearerAuthProvider {
             token: Some(token),
             account_id: None,
             is_fedramp_account: false,
@@ -56,10 +65,15 @@ pub(super) async fn resolve_provider_auth(
 }
 
 pub(super) async fn resolve_region(aws: &ModelProviderAwsAuthInfo) -> Result<String> {
-    match resolve_auth_method(aws).await? {
-        BedrockAuthMethod::EnvBearerToken { region, .. } => Ok(region),
-        BedrockAuthMethod::AwsSdkAuth { context, .. } => Ok(context.region().to_string()),
+    if bearer_token_from_env().is_some() {
+        return bearer_token_region_from_config(aws);
     }
+
+    let config = aws_auth_config(aws);
+    let context = AwsAuthContext::load(config)
+        .await
+        .map_err(aws_auth_error_to_codex_error)?;
+    Ok(context.region().to_string())
 }
 
 fn bearer_token_from_env() -> Option<String> {

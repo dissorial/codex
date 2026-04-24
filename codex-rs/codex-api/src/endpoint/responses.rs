@@ -94,6 +94,24 @@ impl<T: HttpTransport> ResponsesClient<T> {
             insert_header(&mut headers, "x-openai-subagent", &subagent);
         }
 
+        if self
+            .session
+            .provider()
+            .is_anthropic_bedrock_claude_endpoint()
+        {
+            return crate::endpoint::anthropic_bedrock::stream_request(
+                &self.session,
+                request,
+                headers,
+            )
+            .await;
+        }
+
+        if self.session.provider().is_google_gemini_endpoint() {
+            return crate::endpoint::google_gemini::stream_request(&self.session, request, headers)
+                .await;
+        }
+
         self.stream(body, headers, compression, turn_state).await
     }
 

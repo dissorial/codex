@@ -976,7 +976,9 @@ pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
         id: sub_id,
         msg: EventMsg::ShutdownComplete,
     };
-    sess.send_event_raw(event).await;
+    // Thread persistence is already shut down at this point. ShutdownComplete is
+    // a subscriber control event, not durable conversation history.
+    sess.deliver_event_raw(event).await;
     true
 }
 
