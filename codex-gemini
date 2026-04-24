@@ -2,15 +2,6 @@
 set -euo pipefail
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-binary="$repo_dir/codex-rs/target/debug/codex"
 
-if [[ ! -x "$binary" ]]; then
-  (cd "$repo_dir/codex-rs" && cargo build -p codex-cli)
-fi
-
-export CODEX_HOME="$repo_dir/.codex-gemini"
-
-exec "$binary" \
-  -c 'model_provider="google-gemini-local"' \
-  -m "${CODEX_GEMINI_MODEL:-gemini-3.1-pro-preview-customtools}" \
-  "$@"
+export CODEX_AGN_MODEL="${CODEX_GEMINI_MODEL:-gemini-3.1-pro-preview-customtools}"
+exec "$repo_dir/codex-agn" "$@"

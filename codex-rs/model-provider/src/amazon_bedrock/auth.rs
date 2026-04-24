@@ -166,6 +166,9 @@ mod tests {
         let region = bearer_token_region_from_config(&ModelProviderAwsAuthInfo {
             profile: None,
             region: Some(" us-west-2 ".to_string()),
+            access_key_id: None,
+            secret_access_key: None,
+            session_token: None,
         })
         .expect("configured region should resolve");
         let provider = BearerAuthProvider {
@@ -191,6 +194,9 @@ mod tests {
         let err = bearer_token_region_from_config(&ModelProviderAwsAuthInfo {
             profile: None,
             region: None,
+            access_key_id: None,
+            secret_access_key: None,
+            session_token: None,
         })
         .expect_err("missing region should fail");
 
