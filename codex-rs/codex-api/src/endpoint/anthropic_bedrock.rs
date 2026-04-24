@@ -8,6 +8,7 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::TokenUsage;
 use http::HeaderMap;
 use http::HeaderValue;
@@ -46,14 +47,33 @@ pub(crate) async fn stream_request<T: HttpTransport>(
 }
 
 fn anthropic_request_body(request: &ResponsesApiRequest) -> Value {
-    json!({
+    let mut body = json!({
         "anthropic_version": ANTHROPIC_VERSION,
         "system": request.instructions,
         "max_tokens": MAX_OUTPUT_TOKENS,
         "messages": anthropic_messages(&request.input),
         "tools": anthropic_tools(&request.tools),
         "tool_choice": {"type": "auto"},
-    })
+    });
+    if let Some(thinking) = anthropic_thinking(request) {
+        body["thinking"] = thinking;
+    }
+    body
+}
+
+fn anthropic_thinking(request: &ResponsesApiRequest) -> Option<Value> {
+    let effort = request.reasoning.as_ref()?.effort?;
+    let effort = match effort {
+        ReasoningEffort::Low => "low",
+        ReasoningEffort::Medium => "medium",
+        ReasoningEffort::High => "high",
+        ReasoningEffort::None | ReasoningEffort::Minimal | ReasoningEffort::XHigh => return None,
+    };
+    Some(json!({
+        "type": "adaptive",
+        "effort": effort,
+        "display": "summarized",
+    }))
 }
 
 fn anthropic_messages(items: &[ResponseItem]) -> Vec<Value> {
@@ -381,5 +401,47 @@ mod tests {
         assert_eq!(messages[2]["role"], "user");
         assert_eq!(messages[2]["content"][0]["type"], "tool_result");
         assert_eq!(messages[2]["content"][0]["tool_use_id"], "toolu_test");
+    }
+
+    #[test]
+    fn anthropic_request_body_maps_reasoning_effort_to_adaptive_thinking() {
+        let request = ResponsesApiRequest {
+            model: "global.anthropic.claude-opus-4-6-v1".to_string(),
+            instructions: String::new(),
+            input: vec![ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "think".to_string(),
+                }],
+                end_turn: None,
+                phase: None,
+            }],
+            tools: Vec::new(),
+            tool_choice: "auto".to_string(),
+            parallel_tool_calls: true,
+            reasoning: Some(crate::common::Reasoning {
+                effort: Some(ReasoningEffort::High),
+                summary: None,
+            }),
+            store: false,
+            stream: false,
+            include: Vec::new(),
+            service_tier: None,
+            prompt_cache_key: None,
+            text: None,
+            client_metadata: None,
+        };
+
+        let body = anthropic_request_body(&request);
+
+        assert_eq!(
+            body["thinking"],
+            json!({
+                "type": "adaptive",
+                "effort": "high",
+                "display": "summarized",
+            })
+        );
     }
 }
