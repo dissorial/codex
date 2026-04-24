@@ -9,6 +9,8 @@ fn bedrock_claude_opus_46_has_explicit_model_metadata() {
     assert_eq!(model.slug, "global.anthropic.claude-opus-4-6-v1");
     assert_eq!(model.display_name, "Claude Opus 4.6 (Bedrock)");
     assert_eq!(model.context_window, Some(1_000_000));
+    assert_eq!(model.default_reasoning_level, Some(ReasoningEffort::High));
+    assert_eq!(model.supported_reasoning_levels.len(), 3);
     assert!(!model.used_fallback_model_metadata);
     assert!(model.model_messages.is_some());
 }
