@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+binary="$repo_dir/codex-rs/target/debug/codex"
+codex_home="$repo_dir/.codex-agn"
+
+if [[ ! -x "$binary" ]]; then
+  (cd "$repo_dir/codex-rs" && cargo build -p codex-cli)
+fi
+
+mkdir -p "$codex_home"
+export CODEX_HOME="$codex_home"
+
+args=()
+if [[ -n "${CODEX_AGN_MODEL:-}" ]]; then
+  args=(-m "$CODEX_AGN_MODEL")
+fi
+
+exec "$binary" "${args[@]}" "$@"

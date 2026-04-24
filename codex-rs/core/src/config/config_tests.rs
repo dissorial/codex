@@ -541,6 +541,54 @@ async fn runtime_config_defaults_model_availability_nux() {
     );
 }
 
+#[tokio::test]
+async fn model_provider_routes_resolve_exact_and_prefix_matches() {
+    let mut cfg = ConfigToml::default();
+    cfg.model_provider_routes = HashMap::from([
+        (
+            "global.anthropic.claude-opus-4-6-v1".to_string(),
+            "openai".to_string(),
+        ),
+        ("gemini-".to_string() + "*", "openai".to_string()),
+    ]);
+    let config = Config::load_from_base_config_with_overrides(
+        cfg,
+        ConfigOverrides::default(),
+        tempdir().expect("tempdir").abs(),
+    )
+    .await
+    .expect("load config");
+
+    let (exact_provider_id, _) =
+        config.resolve_model_provider_for_model("global.anthropic.claude-opus-4-6-v1");
+    assert_eq!(exact_provider_id, "openai");
+
+    let (prefix_provider_id, _) =
+        config.resolve_model_provider_for_model("gemini-3.1-pro-preview-customtools");
+    assert_eq!(prefix_provider_id, "openai");
+}
+
+#[tokio::test]
+async fn model_provider_routes_reject_unknown_providers() {
+    let mut cfg = ConfigToml::default();
+    cfg.model_provider_routes = HashMap::from([(
+        "gemini-3.1-pro-preview".to_string(),
+        "missing-provider".to_string(),
+    )]);
+
+    let err = Config::load_from_base_config_with_overrides(
+        cfg,
+        ConfigOverrides::default(),
+        tempdir().expect("tempdir").abs(),
+    )
+    .await
+    .expect_err("unknown route provider should fail");
+
+    assert!(err.to_string().contains(
+        "model_provider_routes.gemini-3.1-pro-preview: provider `missing-provider` not found"
+    ));
+}
+
 #[test]
 fn config_toml_deserializes_permission_profiles() {
     let toml = r#"
@@ -5170,6 +5218,7 @@ async fn test_precedence_fixture_with_o3_profile() -> std::io::Result<()> {
             service_tier: None,
             model_provider_id: "openai".to_string(),
             model_provider: fixture.openai_provider.clone(),
+            model_provider_routes: HashMap::new(),
             permissions: Permissions {
                 approval_policy: Constrained::allow_any(AskForApproval::Never),
                 sandbox_policy: Constrained::allow_any(SandboxPolicy::new_read_only_policy()),
@@ -5367,6 +5416,7 @@ async fn test_precedence_fixture_with_gpt3_profile() -> std::io::Result<()> {
         service_tier: None,
         model_provider_id: "openai-custom".to_string(),
         model_provider: fixture.openai_custom_provider.clone(),
+        model_provider_routes: HashMap::new(),
         permissions: Permissions {
             approval_policy: Constrained::allow_any(AskForApproval::UnlessTrusted),
             sandbox_policy: Constrained::allow_any(SandboxPolicy::new_read_only_policy()),
@@ -5518,6 +5568,7 @@ async fn test_precedence_fixture_with_zdr_profile() -> std::io::Result<()> {
         service_tier: None,
         model_provider_id: "openai".to_string(),
         model_provider: fixture.openai_provider.clone(),
+        model_provider_routes: HashMap::new(),
         permissions: Permissions {
             approval_policy: Constrained::allow_any(AskForApproval::OnFailure),
             sandbox_policy: Constrained::allow_any(SandboxPolicy::new_read_only_policy()),
@@ -5654,6 +5705,7 @@ async fn test_precedence_fixture_with_gpt5_profile() -> std::io::Result<()> {
         service_tier: None,
         model_provider_id: "openai".to_string(),
         model_provider: fixture.openai_provider.clone(),
+        model_provider_routes: HashMap::new(),
         permissions: Permissions {
             approval_policy: Constrained::allow_any(AskForApproval::OnFailure),
             sandbox_policy: Constrained::allow_any(SandboxPolicy::new_read_only_policy()),

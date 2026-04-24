@@ -70,6 +70,7 @@ coverage/
 personal/
 .codex-bedrock/
 .codex-gemini/
+.codex-agn/
 
 # os
 .DS_Store

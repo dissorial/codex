@@ -254,6 +254,9 @@ mod tests {
         let err = AwsAuthContext::load(AwsAuthConfig {
             profile: None,
             region: None,
+            access_key_id: None,
+            secret_access_key: None,
+            session_token: None,
             service: "   ".to_string(),
         })
         .await

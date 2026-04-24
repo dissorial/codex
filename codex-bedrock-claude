@@ -2,18 +2,6 @@
 set -euo pipefail
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-codex_bin="$repo_dir/codex-rs/target/debug/codex"
-codex_home="$repo_dir/.codex-bedrock"
 
-mkdir -p "$codex_home"
-
-if [[ ! -x "$codex_bin" ]]; then
-  cargo build --manifest-path "$repo_dir/codex-rs/Cargo.toml" -p codex-cli
-fi
-
-export CODEX_HOME="$codex_home"
-
-exec "$codex_bin" \
-  -c 'model_provider="amazon-bedrock-claude"' \
-  -m "${CODEX_BEDROCK_CLAUDE_MODEL:-global.anthropic.claude-opus-4-6-v1}" \
-  "$@"
+export CODEX_AGN_MODEL="${CODEX_BEDROCK_CLAUDE_MODEL:-global.anthropic.claude-opus-4-6-v1}"
+exec "$repo_dir/codex-agn" "$@"

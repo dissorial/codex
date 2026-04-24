@@ -109,6 +109,18 @@ pub fn model_info_from_slug(slug: &str) -> ModelInfo {
     }
 }
 
+pub fn local_provider_models() -> Vec<ModelInfo> {
+    [
+        "gemini-3.1-pro-preview-customtools",
+        "gemini-3.1-pro-preview",
+        "global.anthropic.claude-opus-4-6-v1",
+        "us.anthropic.claude-opus-4-6-v1",
+    ]
+    .into_iter()
+    .map(model_info_from_slug)
+    .collect()
+}
+
 fn is_gemini_31_pro_slug(slug: &str) -> bool {
     matches!(
         slug,

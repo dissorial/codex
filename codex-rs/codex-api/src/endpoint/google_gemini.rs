@@ -357,16 +357,64 @@ fn sanitize_gemini_schema(value: Value) -> Value {
             object.remove("$id");
             object.remove("title");
             object.remove("default");
+            if let Some(value) = object.remove("any_of") {
+                object.insert("anyOf".to_string(), value);
+            }
+            if let Some(value) = object.remove("one_of") {
+                object.insert("oneOf".to_string(), value);
+            }
+            if let Some(value) = object.remove("all_of") {
+                object.insert("allOf".to_string(), value);
+            }
             for value in object.values_mut() {
                 let taken = std::mem::take(value);
                 *value = sanitize_gemini_schema(taken);
             }
+            sanitize_required_properties(&mut object);
+            sanitize_enum_values(&mut object);
             Value::Object(object)
         }
         Value::Array(values) => {
             Value::Array(values.into_iter().map(sanitize_gemini_schema).collect())
         }
         other => other,
+    }
+}
+
+fn sanitize_required_properties(object: &mut Map<String, Value>) {
+    let property_names = object
+        .get("properties")
+        .and_then(Value::as_object)
+        .map(|properties| {
+            properties
+                .keys()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>()
+        });
+    let Some(required) = object.get_mut("required").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let Some(property_names) = property_names else {
+        object.remove("required");
+        return;
+    };
+    required.retain(|value| {
+        value
+            .as_str()
+            .is_some_and(|property| property_names.contains(property))
+    });
+    if required.is_empty() {
+        object.remove("required");
+    }
+}
+
+fn sanitize_enum_values(object: &mut Map<String, Value>) {
+    let Some(values) = object.get_mut("enum").and_then(Value::as_array_mut) else {
+        return;
+    };
+    values.retain(|value| value.as_str() != Some(""));
+    if values.is_empty() {
+        object.remove("enum");
     }
 }
 
@@ -573,24 +621,37 @@ mod tests {
         let schema = sanitize_gemini_schema(json!({
             "type": "object",
             "additionalProperties": false,
+            "required": ["items", "missing"],
             "properties": {
                 "items": {
                     "type": "array",
+                    "any_of": [{"type": "string"}],
                     "items": {
                         "type": "object",
                         "additionalProperties": false,
                         "default": {},
+                        "required": ["missing"],
+                        "enum": ["", "ok"],
                     }
                 }
             }
         }));
 
         assert!(schema.pointer("/additionalProperties").is_none());
+        assert_eq!(schema.pointer("/required/0"), Some(&json!("items")));
+        assert!(schema.pointer("/required/1").is_none());
+        assert!(schema.pointer("/properties/items/any_of").is_none());
+        assert!(schema.pointer("/properties/items/anyOf").is_some());
         assert!(
             schema
                 .pointer("/properties/items/items/additionalProperties")
                 .is_none()
         );
         assert!(schema.pointer("/properties/items/items/default").is_none());
+        assert!(schema.pointer("/properties/items/items/required").is_none());
+        assert_eq!(
+            schema.pointer("/properties/items/items/enum/0"),
+            Some(&json!("ok"))
+        );
     }
 }

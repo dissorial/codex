@@ -16,7 +16,8 @@ pub(crate) fn auth_manager_for_provider(
 ) -> Option<Arc<AuthManager>> {
     match provider.auth.clone() {
         Some(config) => Some(AuthManager::external_bearer_only(config)),
-        None => auth_manager,
+        None if provider.requires_openai_auth => auth_manager,
+        None => None,
     }
 }
 

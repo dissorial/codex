@@ -78,10 +78,16 @@ mod tests {
             aws_auth_config(&ModelProviderAwsAuthInfo {
                 profile: Some("codex-bedrock".to_string()),
                 region: None,
+                access_key_id: None,
+                secret_access_key: None,
+                session_token: None,
             }),
             AwsAuthConfig {
                 profile: Some("codex-bedrock".to_string()),
                 region: None,
+                access_key_id: None,
+                secret_access_key: None,
+                session_token: None,
                 service: "bedrock-mantle".to_string(),
             }
         );
@@ -93,10 +99,16 @@ mod tests {
             aws_auth_config(&ModelProviderAwsAuthInfo {
                 profile: None,
                 region: Some(" us-west-2 ".to_string()),
+                access_key_id: None,
+                secret_access_key: None,
+                session_token: None,
             }),
             AwsAuthConfig {
                 profile: None,
                 region: Some("us-west-2".to_string()),
+                access_key_id: None,
+                secret_access_key: None,
+                session_token: None,
                 service: "bedrock-mantle".to_string(),
             }
         );

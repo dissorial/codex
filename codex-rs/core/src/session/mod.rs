@@ -555,6 +555,11 @@ impl Codex {
         let model = models_manager
             .get_default_model(&config.model, refresh_strategy)
             .await;
+        let config = {
+            let mut config_for_model = (*config).clone();
+            config_for_model.apply_model_provider_for_model(model.as_str());
+            Arc::new(config_for_model)
+        };
 
         // Resolve base instructions for the session. Priority order:
         // 1. config.base_instructions override

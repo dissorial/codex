@@ -854,7 +854,12 @@ fn build_available_models_picks_default_after_hiding_hidden_models() {
 
     let available = manager.build_available_models(vec![hidden_model, visible_model]);
 
-    assert_eq!(available, vec![expected_hidden, expected_visible]);
+    assert_eq!(&available[..2], &[expected_hidden, expected_visible]);
+    assert!(
+        available
+            .iter()
+            .any(|preset| preset.model == "gemini-3.1-pro-preview-customtools")
+    );
 }
 
 #[test]

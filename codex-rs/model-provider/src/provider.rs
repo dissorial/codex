@@ -150,7 +150,22 @@ mod tests {
             ModelProviderInfo::create_amazon_bedrock_provider(Some(ModelProviderAwsAuthInfo {
                 profile: Some("codex-bedrock".to_string()),
                 region: None,
+                access_key_id: None,
+                secret_access_key: None,
+                session_token: None,
             })),
+            Some(AuthManager::from_auth_for_testing(CodexAuth::from_api_key(
+                "openai-api-key",
+            ))),
+        );
+
+        assert!(provider.auth_manager().is_none());
+    }
+
+    #[test]
+    fn create_model_provider_does_not_use_openai_auth_manager_for_google_gemini_provider() {
+        let provider = create_model_provider(
+            ModelProviderInfo::create_google_gemini_provider(),
             Some(AuthManager::from_auth_for_testing(CodexAuth::from_api_key(
                 "openai-api-key",
             ))),

@@ -201,6 +201,11 @@ pub struct ConfigToml {
     #[serde(default, deserialize_with = "deserialize_model_providers")]
     pub model_providers: HashMap<String, ModelProviderInfo>,
 
+    /// Optional model slug to provider-id routes. Exact model slugs are
+    /// supported, and keys ending in `*` are treated as prefix routes.
+    #[serde(default)]
+    pub model_provider_routes: HashMap<String, String>,
+
     /// Maximum number of bytes to include from an AGENTS.md project doc file.
     pub project_doc_max_bytes: Option<usize>,
 

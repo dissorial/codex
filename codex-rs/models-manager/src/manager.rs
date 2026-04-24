@@ -533,6 +533,14 @@ impl ModelsManager {
 
     /// Build picker-ready presets from the active catalog snapshot.
     fn build_available_models(&self, mut remote_models: Vec<ModelInfo>) -> Vec<ModelPreset> {
+        for local_model in model_info::local_provider_models() {
+            if !remote_models
+                .iter()
+                .any(|remote_model| remote_model.slug == local_model.slug)
+            {
+                remote_models.push(local_model);
+            }
+        }
         remote_models.sort_by(|a, b| a.priority.cmp(&b.priority));
 
         let mut presets: Vec<ModelPreset> = remote_models.into_iter().map(Into::into).collect();
