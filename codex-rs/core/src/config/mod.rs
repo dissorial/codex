@@ -576,6 +576,10 @@ pub struct Config {
     /// Info needed to make an API request to the model.
     pub model_provider: ModelProviderInfo,
 
+    /// Optional model slug to provider-id routes. Exact model slugs are
+    /// supported, and keys ending in `*` are treated as prefix routes.
+    pub model_provider_routes: HashMap<String, String>,
+
     /// Optionally specify the personality of the model
     pub personality: Option<Personality>,
 
@@ -2251,6 +2255,36 @@ fn resolve_multi_agent_v2_config(config_toml: &ConfigToml) -> MultiAgentV2Config
     }
 }
 
+fn validate_model_provider_routes(
+    routes: &HashMap<String, String>,
+    model_providers: &HashMap<String, ModelProviderInfo>,
+) -> std::io::Result<()> {
+    for (model_pattern, provider_id) in routes {
+        if model_pattern.trim().is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "model_provider_routes contains an empty model route",
+            ));
+        }
+        if provider_id.trim().is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("model_provider_routes.{model_pattern}: provider id must not be empty"),
+            ));
+        }
+        if !model_providers.contains_key(provider_id) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "model_provider_routes.{model_pattern}: provider `{provider_id}` not found"
+                ),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 fn resolve_terminal_resize_reflow_config(config_toml: &ConfigToml) -> TerminalResizeReflowConfig {
     let Some(tui) = config_toml.tui.as_ref() else {
         return TerminalResizeReflowConfig::default();
@@ -2984,6 +3018,7 @@ impl Config {
                 std::io::Error::new(std::io::ErrorKind::NotFound, message)
             })?
             .clone();
+        validate_model_provider_routes(&cfg.model_provider_routes, &model_providers)?;
 
         let shell_environment_policy = cfg.shell_environment_policy.into();
         let allow_login_shell = cfg.allow_login_shell.unwrap_or(true);
@@ -3357,6 +3392,7 @@ impl Config {
                 .unwrap_or_default(),
             model_provider_id,
             model_provider,
+            model_provider_routes: cfg.model_provider_routes,
             cwd: resolved_cwd,
             workspace_roots: workspace_roots.clone(),
             workspace_roots_explicit,
@@ -3575,6 +3611,35 @@ impl Config {
         Ok(config)
         })
         .await
+    }
+
+    pub fn resolve_model_provider_for_model(&self, model: &str) -> (String, ModelProviderInfo) {
+        let routed_provider_id = self.model_provider_routes.get(model).or_else(|| {
+            self.model_provider_routes
+                .iter()
+                .filter_map(|(pattern, provider_id)| {
+                    pattern
+                        .strip_suffix('*')
+                        .filter(|prefix| model.starts_with(prefix))
+                        .map(|prefix| (prefix.len(), provider_id))
+                })
+                .max_by_key(|(prefix_len, _)| *prefix_len)
+                .map(|(_, provider_id)| provider_id)
+        });
+
+        if let Some(provider_id) = routed_provider_id
+            && let Some(provider) = self.model_providers.get(provider_id)
+        {
+            return (provider_id.clone(), provider.clone());
+        }
+
+        (self.model_provider_id.clone(), self.model_provider.clone())
+    }
+
+    pub fn apply_model_provider_for_model(&mut self, model: &str) {
+        let (provider_id, provider) = self.resolve_model_provider_for_model(model);
+        self.model_provider_id = provider_id;
+        self.model_provider = provider;
     }
 
     /// If `path` is `Some`, attempts to read the file at the given path and

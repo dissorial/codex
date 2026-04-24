@@ -169,6 +169,7 @@ impl TurnContext {
     ) -> Self {
         let mut config = (*self.config).clone();
         config.model = Some(model.clone());
+        config.apply_model_provider_for_model(model.as_str());
         let model_info = models_manager
             .get_model_info(model.as_str(), &config.to_models_manager_config())
             .await;
@@ -204,6 +205,8 @@ impl TurnContext {
         let available_models = models_manager
             .list_models(RefreshStrategy::OnlineIfUncached)
             .await;
+        let provider =
+            create_model_provider(config.model_provider.clone(), self.auth_manager.clone());
 
         Self {
             sub_id: self.sub_id.clone(),
@@ -216,7 +219,7 @@ impl TurnContext {
                 .session_telemetry
                 .clone()
                 .with_model(model.as_str(), model_info.slug.as_str()),
-            provider: self.provider.clone(),
+            provider,
             reasoning_effort,
             reasoning_summary: self.reasoning_summary,
             session_source: self.session_source.clone(),
