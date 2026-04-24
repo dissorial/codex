@@ -1,6 +1,7 @@
 mod auth;
 mod catalog;
 mod mantle;
+mod runtime;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -40,6 +41,9 @@ impl AmazonBedrockModelProvider {
             .unwrap_or(ModelProviderAwsAuthInfo {
                 profile: None,
                 region: None,
+                access_key_id: None,
+                secret_access_key: None,
+                session_token: None,
             });
         Self {
             info: provider_info,
@@ -79,16 +83,25 @@ impl ModelProvider for AmazonBedrockModelProvider {
 
     async fn api_provider(&self) -> Result<Provider> {
         let mut api_provider_info = self.info.clone();
-        api_provider_info.base_url = Some(runtime_base_url(&self.aws).await?);
+        api_provider_info.base_url = Some(if self.info.is_amazon_bedrock_claude() {
+            let region = auth::resolve_region(&self.aws).await?;
+            runtime::base_url(&region)
+        } else {
+            runtime_base_url(&self.aws).await?
+        });
         api_provider_info.to_api_provider(/*auth_mode*/ None)
     }
 
     async fn runtime_base_url(&self) -> Result<Option<String>> {
+        if self.info.is_amazon_bedrock_claude() {
+            let region = auth::resolve_region(&self.aws).await?;
+            return Ok(Some(runtime::base_url(&region)));
+        }
         Ok(Some(runtime_base_url(&self.aws).await?))
     }
 
     async fn api_auth(&self) -> Result<SharedAuthProvider> {
-        resolve_provider_auth(&self.aws).await
+        resolve_provider_auth(&self.info, &self.aws).await
     }
 
     fn models_manager(

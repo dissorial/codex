@@ -1,4 +1,6 @@
+pub(crate) mod anthropic_bedrock;
 pub(crate) mod compact;
+pub(crate) mod google_gemini;
 pub(crate) mod memories;
 pub(crate) mod models;
 pub(crate) mod realtime_call;

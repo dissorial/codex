@@ -133,7 +133,7 @@ pub fn create_model_provider(
     provider_info: ModelProviderInfo,
     auth_manager: Option<Arc<AuthManager>>,
 ) -> SharedModelProvider {
-    if provider_info.is_amazon_bedrock() {
+    if provider_info.is_amazon_bedrock() || provider_info.is_amazon_bedrock_claude() {
         Arc::new(AmazonBedrockModelProvider::new(provider_info))
     } else {
         Arc::new(ConfiguredModelProvider::new(provider_info, auth_manager))

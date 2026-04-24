@@ -26,6 +26,9 @@ pub(super) fn aws_auth_config(aws: &ModelProviderAwsAuthInfo) -> AwsAuthConfig {
     AwsAuthConfig {
         profile: aws.profile.clone(),
         region: region_from_config(aws),
+        access_key_id: aws.access_key_id.clone(),
+        secret_access_key: aws.secret_access_key.clone(),
+        session_token: aws.session_token.clone(),
         service: BEDROCK_MANTLE_SERVICE_NAME.to_string(),
     }
 }
@@ -54,7 +57,7 @@ pub(super) async fn runtime_base_url(aws: &ModelProviderAwsAuthInfo) -> Result<S
 }
 
 async fn resolve_region(aws: &ModelProviderAwsAuthInfo) -> Result<String> {
-    match resolve_auth_method(aws).await? {
+    match resolve_auth_method(/*provider_info*/ None, aws).await? {
         BedrockAuthMethod::EnvBearerToken { region, .. } => Ok(region),
         BedrockAuthMethod::AwsSdkAuth { context } => Ok(context.region().to_string()),
     }
