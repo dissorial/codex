@@ -1,7 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source_path="${BASH_SOURCE[0]}"
+while [[ -L "$source_path" ]]; do
+  source_dir="$(cd -P "$(dirname "$source_path")" && pwd)"
+  target="$(readlink "$source_path")"
+  if [[ "$target" == /* ]]; then
+    source_path="$target"
+  else
+    source_path="$source_dir/$target"
+  fi
+done
+repo_dir="$(cd -P "$(dirname "$source_path")" && pwd)"
 binary="$repo_dir/codex-rs/target/debug/codex"
 codex_home="$repo_dir/.codex-agn"
 
