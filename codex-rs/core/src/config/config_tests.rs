@@ -572,7 +572,7 @@ async fn model_provider_routes_resolve_exact_and_prefix_matches() {
 async fn model_provider_routes_reject_unknown_providers() {
     let mut cfg = ConfigToml::default();
     cfg.model_provider_routes = HashMap::from([(
-        "gemini-3.1-pro-preview".to_string(),
+        "gemini-3.1-pro-preview-customtools".to_string(),
         "missing-provider".to_string(),
     )]);
 
@@ -585,7 +585,7 @@ async fn model_provider_routes_reject_unknown_providers() {
     .expect_err("unknown route provider should fail");
 
     assert!(err.to_string().contains(
-        "model_provider_routes.gemini-3.1-pro-preview: provider `missing-provider` not found"
+        "model_provider_routes.gemini-3.1-pro-preview-customtools: provider `missing-provider` not found"
     ));
 }
 

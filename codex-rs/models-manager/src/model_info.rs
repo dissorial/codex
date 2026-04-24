@@ -112,7 +112,6 @@ pub fn model_info_from_slug(slug: &str) -> ModelInfo {
 pub fn local_provider_models() -> Vec<ModelInfo> {
     [
         "gemini-3.1-pro-preview-customtools",
-        "gemini-3.1-pro-preview",
         "global.anthropic.claude-opus-4-6-v1",
         "us.anthropic.claude-opus-4-6-v1",
     ]
@@ -122,20 +121,13 @@ pub fn local_provider_models() -> Vec<ModelInfo> {
 }
 
 fn is_gemini_31_pro_slug(slug: &str) -> bool {
-    matches!(
-        slug,
-        "gemini-3.1-pro-preview" | "gemini-3.1-pro-preview-customtools"
-    )
+    matches!(slug, "gemini-3.1-pro-preview-customtools")
 }
 
 fn gemini_31_pro_model_info(slug: &str) -> ModelInfo {
     ModelInfo {
         slug: slug.to_string(),
-        display_name: if slug.ends_with("-customtools") {
-            "Gemini 3.1 Pro Preview Custom Tools".to_string()
-        } else {
-            "Gemini 3.1 Pro Preview".to_string()
-        },
+        display_name: "Gemini 3.1 Pro Preview Custom Tools".to_string(),
         description: Some("Google Gemini 3.1 Pro Preview through the Gemini API.".to_string()),
         default_reasoning_level: Some(ReasoningEffort::High),
         supported_reasoning_levels: vec![
