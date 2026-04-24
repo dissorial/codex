@@ -58,22 +58,32 @@ fn anthropic_request_body(request: &ResponsesApiRequest) -> Value {
     if let Some(thinking) = anthropic_thinking(request) {
         body["thinking"] = thinking;
     }
+    if let Some(output_config) = anthropic_output_config(request) {
+        body["output_config"] = output_config;
+    }
     body
 }
 
 fn anthropic_thinking(request: &ResponsesApiRequest) -> Option<Value> {
-    let effort = request.reasoning.as_ref()?.effort?;
-    let effort = match effort {
-        ReasoningEffort::Low => "low",
-        ReasoningEffort::Medium => "medium",
-        ReasoningEffort::High => "high",
-        ReasoningEffort::None | ReasoningEffort::Minimal | ReasoningEffort::XHigh => return None,
-    };
+    anthropic_effort(request)?;
     Some(json!({
         "type": "adaptive",
-        "effort": effort,
         "display": "summarized",
     }))
+}
+
+fn anthropic_output_config(request: &ResponsesApiRequest) -> Option<Value> {
+    let effort = anthropic_effort(request)?;
+    Some(json!({ "effort": effort }))
+}
+
+fn anthropic_effort(request: &ResponsesApiRequest) -> Option<&'static str> {
+    match request.reasoning.as_ref()?.effort? {
+        ReasoningEffort::Low => Some("low"),
+        ReasoningEffort::Medium => Some("medium"),
+        ReasoningEffort::High => Some("high"),
+        ReasoningEffort::None | ReasoningEffort::Minimal | ReasoningEffort::XHigh => None,
+    }
 }
 
 fn anthropic_messages(items: &[ResponseItem]) -> Vec<Value> {
@@ -439,9 +449,9 @@ mod tests {
             body["thinking"],
             json!({
                 "type": "adaptive",
-                "effort": "high",
                 "display": "summarized",
             })
         );
+        assert_eq!(body["output_config"], json!({ "effort": "high" }));
     }
 }

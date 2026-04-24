@@ -124,6 +124,10 @@ impl SessionConfiguration {
             );
         if let Some(collaboration_mode) = updates.collaboration_mode.clone() {
             next_configuration.collaboration_mode = collaboration_mode;
+            next_configuration.provider = next_configuration
+                .original_config_do_not_use
+                .resolve_model_provider_for_model(next_configuration.collaboration_mode.model())
+                .1;
         }
         if let Some(summary) = updates.reasoning_summary {
             next_configuration.model_reasoning_summary = Some(summary);

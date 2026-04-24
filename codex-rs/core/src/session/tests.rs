@@ -2904,6 +2904,33 @@ async fn session_settings_null_service_tier_update_clears_service_tier() {
     assert_eq!(updated.service_tier, None);
 }
 
+#[tokio::test]
+async fn session_settings_model_update_recomputes_routed_provider() {
+    let mut session_configuration = make_session_configuration_for_tests().await;
+    Arc::make_mut(&mut session_configuration.original_config_do_not_use)
+        .model_provider_routes
+        .insert(
+            "global.anthropic.claude-opus-4-6-v1".to_string(),
+            "amazon-bedrock-claude".to_string(),
+        );
+
+    let updated = session_configuration
+        .apply(&SessionSettingsUpdate {
+            collaboration_mode: Some(CollaborationMode {
+                mode: ModeKind::Default,
+                settings: Settings {
+                    model: "global.anthropic.claude-opus-4-6-v1".to_string(),
+                    reasoning_effort: Some(ReasoningEffortConfig::High),
+                    developer_instructions: None,
+                },
+            }),
+            ..Default::default()
+        })
+        .expect("model update should apply");
+
+    assert!(updated.provider.is_amazon_bedrock_claude());
+}
+
 pub(crate) async fn make_session_configuration_for_tests() -> SessionConfiguration {
     let codex_home = tempfile::tempdir().expect("create temp dir");
     let config = build_test_config(codex_home.path()).await;
