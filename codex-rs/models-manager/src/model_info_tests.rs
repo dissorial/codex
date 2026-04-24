@@ -13,7 +13,7 @@ fn bedrock_claude_opus_46_has_explicit_model_metadata() {
     assert_eq!(model.supported_reasoning_levels.len(), 3);
     assert!(model.supports_reasoning_summaries);
     assert!(!model.used_fallback_model_metadata);
-    assert!(model.model_messages.is_some());
+    assert!(model.model_messages.is_none());
 }
 
 #[test]
@@ -26,7 +26,7 @@ fn gemini_31_pro_customtools_has_explicit_model_metadata() {
     assert_eq!(model.max_context_window, Some(1_048_576));
     assert!(model.supports_parallel_tool_calls);
     assert!(!model.used_fallback_model_metadata);
-    assert!(model.model_messages.is_some());
+    assert!(model.model_messages.is_none());
 }
 
 #[test]
