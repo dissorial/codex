@@ -89,6 +89,16 @@ impl Provider {
         is_azure_responses_provider(&self.name, Some(&self.base_url))
     }
 
+    pub fn is_anthropic_bedrock_claude_endpoint(&self) -> bool {
+        self.name.eq_ignore_ascii_case("Amazon Bedrock Claude")
+            || self.base_url.contains("bedrock-runtime.")
+    }
+
+    pub fn is_google_gemini_endpoint(&self) -> bool {
+        self.name.eq_ignore_ascii_case("Google Gemini")
+            || self.base_url.contains("generativelanguage.googleapis.com")
+    }
+
     pub fn websocket_url_for_path(&self, path: &str) -> Result<Url, url::ParseError> {
         let mut url = Url::parse(&self.url_for_path(path))?;
 

@@ -15,6 +15,9 @@ use thiserror::Error;
 pub struct AwsAuthConfig {
     pub profile: Option<String>,
     pub region: Option<String>,
+    pub access_key_id: Option<String>,
+    pub secret_access_key: Option<String>,
+    pub session_token: Option<String>,
     pub service: String,
 }
 

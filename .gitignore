@@ -69,6 +69,8 @@ coverage/
 
 # personal files
 personal/
+.codex-bedrock/
+.codex-gemini/
 
 # os
 .DS_Store
