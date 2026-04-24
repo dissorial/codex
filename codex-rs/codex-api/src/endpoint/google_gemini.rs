@@ -10,6 +10,8 @@ use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ReasoningItemReasoningSummary;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::TokenUsage;
+use eventsource_stream::Eventsource;
+use futures::StreamExt;
 use http::HeaderMap;
 use http::HeaderValue;
 use http::Method;
@@ -34,18 +36,16 @@ pub(crate) async fn stream_request<T: HttpTransport>(
     );
     headers.insert(
         http::header::ACCEPT,
-        HeaderValue::from_static("application/json"),
+        HeaderValue::from_static("text/event-stream"),
     );
 
     let body = gemini_request_body(&request);
-    let path = format!("models/{}:generateContent", request.model);
+    let path = format!("models/{}:streamGenerateContent?alt=sse", request.model);
     let response = session
-        .execute(Method::POST, &path, headers, Some(body))
+        .stream_with(Method::POST, &path, headers, Some(body), |_| {})
         .await?;
-    let response: GeminiResponse = serde_json::from_slice(&response.body)
-        .map_err(|e| ApiError::Stream(format!("failed to decode Gemini response: {e}")))?;
 
-    Ok(response_stream_from_response(response))
+    Ok(response_stream_from_sse(response.bytes))
 }
 
 fn gemini_request_body(request: &ResponsesApiRequest) -> Value {
@@ -418,74 +418,173 @@ fn sanitize_enum_values(object: &mut Map<String, Value>) {
     }
 }
 
-fn response_stream_from_response(response: GeminiResponse) -> ResponseStream {
-    let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent, ApiError>>(32);
+fn response_stream_from_sse(bytes: codex_client::ByteStream) -> ResponseStream {
+    let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent, ApiError>>(1600);
     tokio::spawn(async move {
         let _ = tx_event.send(Ok(ResponseEvent::Created)).await;
+        let mut stream = bytes.eventsource();
+        let mut state = GeminiStreamState::default();
 
-        let response_id = response.response_id();
-        let mut signature_metadata = HashMap::new();
-        let mut output_text = String::new();
-        if let Some(candidate) = response.candidates.into_iter().next() {
-            for part in candidate.content.parts {
-                if let Some(text) = part.text {
-                    output_text.push_str(&text);
+        while let Some(next) = stream.next().await {
+            let sse = match next {
+                Ok(sse) => sse,
+                Err(err) => {
+                    let _ = tx_event.send(Err(ApiError::Stream(err.to_string()))).await;
+                    return;
                 }
-                if let Some(function_call) = part.function_call {
-                    flush_output_text(&tx_event, &mut output_text).await;
-                    let call_id = if function_call.id.is_empty() {
-                        function_call.name.clone()
-                    } else {
-                        function_call.id
-                    };
-                    if let Some(signature) = part.thought_signature {
-                        signature_metadata.insert(call_id.clone(), signature);
-                    }
-                    let item = ResponseItem::FunctionCall {
-                        id: None,
-                        name: function_call.name,
-                        namespace: None,
-                        arguments: function_call.args.to_string(),
-                        call_id,
-                    };
-                    let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
+            };
+            if sse.data.trim() == "[DONE]" {
+                break;
+            }
+            let response: GeminiResponse = match serde_json::from_str(&sse.data) {
+                Ok(response) => response,
+                Err(err) => {
+                    let _ = tx_event
+                        .send(Err(ApiError::Stream(format!(
+                            "failed to decode Gemini stream event: {err}"
+                        ))))
+                        .await;
+                    return;
                 }
+            };
+            if process_gemini_stream_response(&tx_event, &mut state, response)
+                .await
+                .is_err()
+            {
+                return;
             }
         }
-        flush_output_text(&tx_event, &mut output_text).await;
 
-        if !signature_metadata.is_empty() {
-            let item = gemini_signature_reasoning_item(signature_metadata);
+        if flush_gemini_streaming_output_text(&tx_event, &mut state)
+            .await
+            .is_err()
+        {
+            return;
+        }
+        if !state.signature_metadata.is_empty() {
+            let item =
+                gemini_signature_reasoning_item(std::mem::take(&mut state.signature_metadata));
             let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
         }
-
         let _ = tx_event
             .send(Ok(ResponseEvent::Completed {
-                response_id,
-                token_usage: response.usage_metadata.map(Into::into),
+                response_id: state
+                    .response_id
+                    .unwrap_or_else(|| "gemini-response".to_string()),
+                token_usage: state.usage_metadata.map(Into::into),
             }))
             .await;
     });
     ResponseStream { rx_event }
 }
 
-async fn flush_output_text(
+#[derive(Default)]
+struct GeminiStreamState {
+    response_id: Option<String>,
+    usage_metadata: Option<GeminiUsageMetadata>,
+    signature_metadata: HashMap<String, String>,
+    text_open: bool,
+    text_block_index: u32,
+    output_text: String,
+}
+
+async fn process_gemini_stream_response(
     tx_event: &mpsc::Sender<Result<ResponseEvent, ApiError>>,
-    output_text: &mut String,
-) {
-    if output_text.is_empty() {
-        return;
+    state: &mut GeminiStreamState,
+    response: GeminiResponse,
+) -> Result<(), ()> {
+    if let Some(response_id) = response.response_id {
+        state.response_id = Some(response_id);
+    }
+    if response.usage_metadata.is_some() {
+        state.usage_metadata = response.usage_metadata;
+    }
+
+    let Some(candidate) = response.candidates.into_iter().next() else {
+        return Ok(());
+    };
+    for part in candidate.content.parts {
+        if let Some(text) = part.text
+            && !text.is_empty()
+        {
+            send_gemini_streaming_output_text_delta(tx_event, state, &text).await?;
+        }
+        if let Some(function_call) = part.function_call {
+            flush_gemini_streaming_output_text(tx_event, state).await?;
+            let call_id = if function_call.id.is_empty() {
+                function_call.name.clone()
+            } else {
+                function_call.id
+            };
+            if let Some(signature) = part.thought_signature {
+                state.signature_metadata.insert(call_id.clone(), signature);
+            }
+            let item = ResponseItem::FunctionCall {
+                id: None,
+                name: function_call.name,
+                namespace: None,
+                arguments: function_call.args.to_string(),
+                call_id,
+            };
+            tx_event
+                .send(Ok(ResponseEvent::OutputItemDone(item)))
+                .await
+                .map_err(|_| ())?;
+        }
+    }
+    Ok(())
+}
+
+async fn send_gemini_streaming_output_text_delta(
+    tx_event: &mpsc::Sender<Result<ResponseEvent, ApiError>>,
+    state: &mut GeminiStreamState,
+    text: &str,
+) -> Result<(), ()> {
+    if !state.text_open {
+        state.text_open = true;
+        let item = ResponseItem::Message {
+            id: Some(format!("gemini-message-{}", state.text_block_index)),
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: String::new(),
+            }],
+            end_turn: None,
+            phase: None,
+        };
+        tx_event
+            .send(Ok(ResponseEvent::OutputItemAdded(item)))
+            .await
+            .map_err(|_| ())?;
+    }
+    state.output_text.push_str(text);
+    tx_event
+        .send(Ok(ResponseEvent::OutputTextDelta(text.to_string())))
+        .await
+        .map_err(|_| ())
+}
+
+async fn flush_gemini_streaming_output_text(
+    tx_event: &mpsc::Sender<Result<ResponseEvent, ApiError>>,
+    state: &mut GeminiStreamState,
+) -> Result<(), ()> {
+    if !state.text_open {
+        return Ok(());
     }
     let item = ResponseItem::Message {
-        id: None,
+        id: Some(format!("gemini-message-{}", state.text_block_index)),
         role: "assistant".to_string(),
         content: vec![ContentItem::OutputText {
-            text: std::mem::take(output_text),
+            text: std::mem::take(&mut state.output_text),
         }],
         end_turn: None,
         phase: None,
     };
-    let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
+    state.text_open = false;
+    state.text_block_index += 1;
+    tx_event
+        .send(Ok(ResponseEvent::OutputItemDone(item)))
+        .await
+        .map_err(|_| ())
 }
 
 fn gemini_signature_reasoning_item(signatures: HashMap<String, String>) -> ResponseItem {
@@ -504,14 +603,6 @@ struct GeminiResponse {
     candidates: Vec<GeminiCandidate>,
     usage_metadata: Option<GeminiUsageMetadata>,
     response_id: Option<String>,
-}
-
-impl GeminiResponse {
-    fn response_id(&self) -> String {
-        self.response_id
-            .clone()
-            .unwrap_or_else(|| "gemini-response".to_string())
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -652,6 +743,166 @@ mod tests {
         assert_eq!(
             schema.pointer("/properties/items/items/enum/0"),
             Some(&json!("ok"))
+        );
+    }
+
+    #[tokio::test]
+    async fn gemini_stream_response_emits_text_deltas_before_completion() {
+        let (tx, mut rx) = mpsc::channel::<Result<ResponseEvent, ApiError>>(8);
+        let mut state = GeminiStreamState::default();
+
+        process_gemini_stream_response(
+            &tx,
+            &mut state,
+            GeminiResponse {
+                response_id: Some("gemini_1".to_string()),
+                usage_metadata: None,
+                candidates: vec![GeminiCandidate {
+                    content: GeminiContent {
+                        parts: vec![GeminiPart {
+                            text: Some("hello ".to_string()),
+                            function_call: None,
+                            thought_signature: None,
+                        }],
+                    },
+                }],
+            },
+        )
+        .await
+        .unwrap();
+        process_gemini_stream_response(
+            &tx,
+            &mut state,
+            GeminiResponse {
+                response_id: None,
+                usage_metadata: Some(GeminiUsageMetadata {
+                    prompt_token_count: Some(7),
+                    candidates_token_count: Some(2),
+                    thoughts_token_count: Some(1),
+                    total_token_count: Some(10),
+                }),
+                candidates: vec![GeminiCandidate {
+                    content: GeminiContent {
+                        parts: vec![GeminiPart {
+                            text: Some("world".to_string()),
+                            function_call: None,
+                            thought_signature: None,
+                        }],
+                    },
+                }],
+            },
+        )
+        .await
+        .unwrap();
+        flush_gemini_streaming_output_text(&tx, &mut state)
+            .await
+            .unwrap();
+
+        match rx.recv().await.unwrap().unwrap() {
+            ResponseEvent::OutputItemAdded(ResponseItem::Message { id, .. }) => {
+                assert_eq!(id.as_deref(), Some("gemini-message-0"));
+            }
+            event => panic!("expected OutputItemAdded, got {event:?}"),
+        }
+        assert!(matches!(
+            rx.recv().await.unwrap().unwrap(),
+            ResponseEvent::OutputTextDelta(text) if text == "hello "
+        ));
+        assert!(matches!(
+            rx.recv().await.unwrap().unwrap(),
+            ResponseEvent::OutputTextDelta(text) if text == "world"
+        ));
+        match rx.recv().await.unwrap().unwrap() {
+            ResponseEvent::OutputItemDone(ResponseItem::Message { content, .. }) => {
+                assert_eq!(
+                    content,
+                    vec![ContentItem::OutputText {
+                        text: "hello world".to_string()
+                    }]
+                );
+            }
+            event => panic!("expected OutputItemDone message, got {event:?}"),
+        }
+
+        assert_eq!(state.response_id.as_deref(), Some("gemini_1"));
+        let usage: TokenUsage = state.usage_metadata.unwrap().into();
+        assert_eq!(usage.input_tokens, 7);
+        assert_eq!(usage.output_tokens, 2);
+        assert_eq!(usage.reasoning_output_tokens, 1);
+        assert_eq!(usage.total_tokens, 10);
+    }
+
+    #[tokio::test]
+    async fn gemini_stream_response_flushes_text_before_function_call() {
+        let (tx, mut rx) = mpsc::channel::<Result<ResponseEvent, ApiError>>(8);
+        let mut state = GeminiStreamState::default();
+
+        process_gemini_stream_response(
+            &tx,
+            &mut state,
+            GeminiResponse {
+                response_id: Some("gemini_2".to_string()),
+                usage_metadata: None,
+                candidates: vec![GeminiCandidate {
+                    content: GeminiContent {
+                        parts: vec![
+                            GeminiPart {
+                                text: Some("I'll run it.".to_string()),
+                                function_call: None,
+                                thought_signature: None,
+                            },
+                            GeminiPart {
+                                text: None,
+                                function_call: Some(GeminiFunctionCall {
+                                    id: "call_1".to_string(),
+                                    name: "shell".to_string(),
+                                    args: json!({"cmd": "echo ok"}),
+                                }),
+                                thought_signature: Some("sig_1".to_string()),
+                            },
+                        ],
+                    },
+                }],
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            rx.recv().await.unwrap().unwrap(),
+            ResponseEvent::OutputItemAdded(ResponseItem::Message { .. })
+        ));
+        assert!(matches!(
+            rx.recv().await.unwrap().unwrap(),
+            ResponseEvent::OutputTextDelta(text) if text == "I'll run it."
+        ));
+        match rx.recv().await.unwrap().unwrap() {
+            ResponseEvent::OutputItemDone(ResponseItem::Message { content, .. }) => {
+                assert_eq!(
+                    content,
+                    vec![ContentItem::OutputText {
+                        text: "I'll run it.".to_string()
+                    }]
+                );
+            }
+            event => panic!("expected OutputItemDone message, got {event:?}"),
+        }
+        match rx.recv().await.unwrap().unwrap() {
+            ResponseEvent::OutputItemDone(ResponseItem::FunctionCall {
+                name,
+                arguments,
+                call_id,
+                ..
+            }) => {
+                assert_eq!(name, "shell");
+                assert_eq!(call_id, "call_1");
+                assert_eq!(arguments, json!({"cmd": "echo ok"}).to_string());
+            }
+            event => panic!("expected FunctionCall, got {event:?}"),
+        }
+        assert_eq!(
+            state.signature_metadata,
+            HashMap::from([("call_1".to_string(), "sig_1".to_string())])
         );
     }
 }
