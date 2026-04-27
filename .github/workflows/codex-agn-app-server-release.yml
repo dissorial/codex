@@ -1,0 +1,122 @@
+name: codex-agn-app-server-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: GitHub release tag to update.
+        required: false
+        default: codex-agn-app-server-latest
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}::${{ inputs.release_tag || 'codex-agn-app-server-latest' }}
+  cancel-in-progress: true
+
+jobs:
+  build-linux:
+    name: Build Linux app-server
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: codex-rs
+    env:
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+      TARGET: x86_64-unknown-linux-gnu
+      ASSET_NAME: codex-app-server-x86_64-unknown-linux-gnu
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Install Linux build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            libcap-dev \
+            pkg-config
+
+      - uses: dtolnay/rust-toolchain@a0b273b48ed29de4470960879e8381ff45632f26
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cache Cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            codex-rs/target
+          key: codex-agn-app-server-${{ runner.os }}-${{ env.TARGET }}-${{ hashFiles('codex-rs/Cargo.lock', 'codex-rs/Cargo.toml') }}
+          restore-keys: |
+            codex-agn-app-server-${{ runner.os }}-${{ env.TARGET }}-
+
+      - name: Build app-server
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --target "${TARGET}" --release -j 2 -p codex-app-server --bin codex-app-server
+
+      - name: Stage release asset
+        id: stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          out_dir="${RUNNER_TEMP}/codex-agn-app-server"
+          mkdir -p "${out_dir}"
+          cp "target/${TARGET}/release/codex-app-server" "${out_dir}/${ASSET_NAME}"
+          chmod +x "${out_dir}/${ASSET_NAME}"
+          (cd "${out_dir}" && sha256sum "${ASSET_NAME}" > "${ASSET_NAME}.sha256")
+          echo "asset_path=${out_dir}/${ASSET_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "checksum_path=${out_dir}/${ASSET_NAME}.sha256" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: ${{ env.ASSET_NAME }}
+          path: |
+            ${{ steps.stage.outputs.asset_path }}
+            ${{ steps.stage.outputs.checksum_path }}
+          if-no-files-found: error
+
+      - name: Publish GitHub release asset
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag || 'codex-agn-app-server-latest' }}
+          ASSET_PATH: ${{ steps.stage.outputs.asset_path }}
+          CHECKSUM_PATH: ${{ steps.stage.outputs.checksum_path }}
+        run: |
+          set -euo pipefail
+          repo="${GITHUB_REPOSITORY}"
+          title="codex-agn app-server latest"
+          notes="Linux app-server build for codex-agn from ${GITHUB_SHA}."
+
+          if ! gh release view "${RELEASE_TAG}" --repo "${repo}" >/dev/null 2>&1; then
+            gh release create "${RELEASE_TAG}" \
+              --repo "${repo}" \
+              --title "${title}" \
+              --notes "${notes}" \
+              --prerelease
+          fi
+
+          gh release upload "${RELEASE_TAG}" \
+            --repo "${repo}" \
+            --clobber \
+            "${ASSET_PATH}" \
+            "${CHECKSUM_PATH}"
+
+          {
+            echo "### codex-agn app-server release"
+            echo
+            echo "Tag: \`${RELEASE_TAG}\`"
+            echo
+            echo "Asset URL:"
+            echo
+            echo "\`https://github.com/${repo}/releases/download/${RELEASE_TAG}/${ASSET_NAME}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
