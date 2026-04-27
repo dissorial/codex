@@ -9,6 +9,7 @@ use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ReasoningItemReasoningSummary;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::models::WebSearchAction;
 use codex_protocol::protocol::TokenUsage;
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
@@ -49,6 +50,7 @@ pub(crate) async fn stream_request<T: HttpTransport>(
 }
 
 fn gemini_request_body(request: &ResponsesApiRequest) -> Value {
+    let uses_web_search = request.tools.iter().any(is_web_search_tool);
     json!({
         "systemInstruction": {
             "parts": gemini_text_parts(&request.instructions),
@@ -56,6 +58,7 @@ fn gemini_request_body(request: &ResponsesApiRequest) -> Value {
         "contents": gemini_contents(&request.input),
         "tools": gemini_tools(&request.tools),
         "toolConfig": {
+            "includeServerSideToolInvocations": uses_web_search,
             "functionCallingConfig": {
                 "mode": "AUTO",
             }
@@ -291,11 +294,18 @@ fn gemini_tools(tools: &[Value]) -> Vec<Value> {
         .iter()
         .flat_map(|tool| gemini_tool_declarations(tool).unwrap_or_default())
         .collect();
-    if declarations.is_empty() {
-        Vec::new()
-    } else {
-        vec![json!({ "functionDeclarations": declarations })]
+    let mut gemini_tools = Vec::new();
+    if !declarations.is_empty() {
+        gemini_tools.push(json!({ "functionDeclarations": declarations }));
     }
+    if tools.iter().any(is_web_search_tool) {
+        gemini_tools.push(json!({ "google_search": {} }));
+    }
+    gemini_tools
+}
+
+fn is_web_search_tool(tool: &Value) -> bool {
+    tool.get("type").and_then(Value::as_str) == Some("web_search")
 }
 
 fn gemini_tool_declarations(tool: &Value) -> Option<Vec<Value>> {
@@ -503,6 +513,9 @@ async fn process_gemini_stream_response(
     let Some(candidate) = response.candidates.into_iter().next() else {
         return Ok(());
     };
+    if let Some(grounding_metadata) = candidate.grounding_metadata {
+        send_gemini_web_search_item(tx_event, grounding_metadata).await?;
+    }
     for part in candidate.content.parts {
         if let Some(text) = part.text
             && !text.is_empty()
@@ -533,6 +546,27 @@ async fn process_gemini_stream_response(
         }
     }
     Ok(())
+}
+
+async fn send_gemini_web_search_item(
+    tx_event: &mpsc::Sender<Result<ResponseEvent, ApiError>>,
+    grounding_metadata: GeminiGroundingMetadata,
+) -> Result<(), ()> {
+    if grounding_metadata.web_search_queries.is_empty() {
+        return Ok(());
+    }
+    let query = grounding_metadata.web_search_queries.first().cloned();
+    let queries = Some(grounding_metadata.web_search_queries);
+    tx_event
+        .send(Ok(ResponseEvent::OutputItemDone(
+            ResponseItem::WebSearchCall {
+                id: Some("gemini-google-search".to_string()),
+                status: Some("completed".to_string()),
+                action: Some(WebSearchAction::Search { query, queries }),
+            },
+        )))
+        .await
+        .map_err(|_| ())
 }
 
 async fn send_gemini_streaming_output_text_delta(
@@ -608,6 +642,7 @@ struct GeminiResponse {
 #[derive(Debug, Deserialize)]
 struct GeminiCandidate {
     content: GeminiContent,
+    grounding_metadata: Option<GeminiGroundingMetadata>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -630,6 +665,13 @@ struct GeminiFunctionCall {
     name: String,
     #[serde(default)]
     args: Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiGroundingMetadata {
+    #[serde(default)]
+    web_search_queries: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -746,6 +788,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn gemini_tools_maps_web_search_to_google_search() {
+        let tools = gemini_tools(&[
+            json!({"type": "web_search", "external_web_access": true}),
+            json!({
+                "type": "function",
+                "name": "shell",
+                "description": "Run a shell command",
+                "parameters": {"type": "object"}
+            }),
+        ]);
+
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["functionDeclarations"][0]["name"], "shell");
+        assert_eq!(tools[1], json!({"google_search": {}}));
+    }
+
+    #[test]
+    fn gemini_request_body_enables_server_side_tool_invocations_for_web_search() {
+        let request = ResponsesApiRequest {
+            model: "gemini-3.1-pro-preview-customtools".to_string(),
+            instructions: String::new(),
+            input: Vec::new(),
+            tools: vec![json!({"type": "web_search", "external_web_access": true})],
+            tool_choice: "auto".to_string(),
+            parallel_tool_calls: true,
+            reasoning: None,
+            store: false,
+            stream: true,
+            include: Vec::new(),
+            service_tier: None,
+            prompt_cache_key: None,
+            text: None,
+            client_metadata: None,
+        };
+
+        let body = gemini_request_body(&request);
+
+        assert_eq!(body["toolConfig"]["includeServerSideToolInvocations"], true);
+    }
+
     #[tokio::test]
     async fn gemini_stream_response_emits_text_deltas_before_completion() {
         let (tx, mut rx) = mpsc::channel::<Result<ResponseEvent, ApiError>>(8);
@@ -758,6 +841,7 @@ mod tests {
                 response_id: Some("gemini_1".to_string()),
                 usage_metadata: None,
                 candidates: vec![GeminiCandidate {
+                    grounding_metadata: None,
                     content: GeminiContent {
                         parts: vec![GeminiPart {
                             text: Some("hello ".to_string()),
@@ -782,6 +866,7 @@ mod tests {
                     total_token_count: Some(10),
                 }),
                 candidates: vec![GeminiCandidate {
+                    grounding_metadata: None,
                     content: GeminiContent {
                         parts: vec![GeminiPart {
                             text: Some("world".to_string()),
@@ -844,6 +929,7 @@ mod tests {
                 response_id: Some("gemini_2".to_string()),
                 usage_metadata: None,
                 candidates: vec![GeminiCandidate {
+                    grounding_metadata: None,
                     content: GeminiContent {
                         parts: vec![
                             GeminiPart {
@@ -904,5 +990,49 @@ mod tests {
             state.signature_metadata,
             HashMap::from([("call_1".to_string(), "sig_1".to_string())])
         );
+    }
+
+    #[tokio::test]
+    async fn gemini_stream_response_maps_grounding_metadata_to_web_search() {
+        let (tx, mut rx) = mpsc::channel::<Result<ResponseEvent, ApiError>>(8);
+        let mut state = GeminiStreamState::default();
+
+        process_gemini_stream_response(
+            &tx,
+            &mut state,
+            GeminiResponse {
+                response_id: Some("gemini_3".to_string()),
+                usage_metadata: None,
+                candidates: vec![GeminiCandidate {
+                    grounding_metadata: Some(GeminiGroundingMetadata {
+                        web_search_queries: vec![
+                            "latest codex cli release".to_string(),
+                            "openai codex cli 0.124".to_string(),
+                        ],
+                    }),
+                    content: GeminiContent { parts: Vec::new() },
+                }],
+            },
+        )
+        .await
+        .unwrap();
+
+        match rx.recv().await.unwrap().unwrap() {
+            ResponseEvent::OutputItemDone(ResponseItem::WebSearchCall { id, status, action }) => {
+                assert_eq!(id.as_deref(), Some("gemini-google-search"));
+                assert_eq!(status.as_deref(), Some("completed"));
+                assert_eq!(
+                    action,
+                    Some(WebSearchAction::Search {
+                        query: Some("latest codex cli release".to_string()),
+                        queries: Some(vec![
+                            "latest codex cli release".to_string(),
+                            "openai codex cli 0.124".to_string(),
+                        ]),
+                    })
+                );
+            }
+            event => panic!("expected WebSearchCall, got {event:?}"),
+        }
     }
 }

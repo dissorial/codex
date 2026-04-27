@@ -10,6 +10,7 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::models::WebSearchAction;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::TokenUsage;
 use futures::StreamExt;
@@ -352,6 +353,12 @@ struct AnthropicToolBlock {
     id: String,
     name: String,
     input_json: String,
+    kind: AnthropicToolBlockKind,
+}
+
+enum AnthropicToolBlockKind {
+    Function,
+    WebSearch,
 }
 
 async fn process_anthropic_stream_event(
@@ -377,8 +384,19 @@ async fn process_anthropic_stream_event(
             let Some(block) = event.get("content_block") else {
                 return Ok(());
             };
-            if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+            let block_type = block.get("type").and_then(Value::as_str);
+            if block_type == Some("tool_use") || block_type == Some("server_tool_use") {
                 flush_streaming_output_text(tx_event, state).await?;
+                let name = block
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("tool")
+                    .to_string();
+                let kind = if block_type == Some("server_tool_use") && name == "web_search" {
+                    AnthropicToolBlockKind::WebSearch
+                } else {
+                    AnthropicToolBlockKind::Function
+                };
                 state.tool_blocks.insert(
                     index,
                     AnthropicToolBlock {
@@ -387,15 +405,12 @@ async fn process_anthropic_stream_event(
                             .and_then(Value::as_str)
                             .unwrap_or("toolu_bedrock")
                             .to_string(),
-                        name: block
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .unwrap_or("tool")
-                            .to_string(),
+                        name,
                         input_json: block
                             .get("input")
                             .map(Value::to_string)
                             .unwrap_or_else(|| "{}".to_string()),
+                        kind,
                     },
                 );
             }
@@ -428,12 +443,25 @@ async fn process_anthropic_stream_event(
             if let Some(block) = state.tool_blocks.remove(&index) {
                 let arguments: Value = serde_json::from_str(&block.input_json)
                     .unwrap_or(Value::Object(Default::default()));
-                let item = ResponseItem::FunctionCall {
-                    id: None,
-                    name: block.name,
-                    namespace: None,
-                    arguments: arguments.to_string(),
-                    call_id: block.id,
+                let item = match block.kind {
+                    AnthropicToolBlockKind::Function => ResponseItem::FunctionCall {
+                        id: None,
+                        name: block.name,
+                        namespace: None,
+                        arguments: arguments.to_string(),
+                        call_id: block.id,
+                    },
+                    AnthropicToolBlockKind::WebSearch => ResponseItem::WebSearchCall {
+                        id: Some(block.id),
+                        status: Some("completed".to_string()),
+                        action: Some(WebSearchAction::Search {
+                            query: arguments
+                                .get("query")
+                                .and_then(Value::as_str)
+                                .map(ToString::to_string),
+                            queries: None,
+                        }),
+                    },
                 };
                 tx_event
                     .send(Ok(ResponseEvent::OutputItemDone(item)))
@@ -935,6 +963,65 @@ mod tests {
                 assert_eq!(arguments, json!({"cmd": "echo ok"}).to_string());
             }
             event => panic!("expected FunctionCall, got {event:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_events_map_server_web_search() {
+        let (tx, mut rx) = mpsc::channel::<Result<ResponseEvent, ApiError>>(8);
+        let mut state = AnthropicStreamState::default();
+
+        process_anthropic_stream_event(
+            &tx,
+            &mut state,
+            json!({
+                "type": "content_block_start",
+                "index": 1,
+                "content_block": {
+                    "type": "server_tool_use",
+                    "id": "srvtoolu_1",
+                    "name": "web_search",
+                    "input": {}
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        process_anthropic_stream_event(
+            &tx,
+            &mut state,
+            json!({
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": "{\"query\":\"latest codex cli release\"}"
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        process_anthropic_stream_event(
+            &tx,
+            &mut state,
+            json!({"type": "content_block_stop", "index": 1}),
+        )
+        .await
+        .unwrap();
+
+        match rx.recv().await.unwrap().unwrap() {
+            ResponseEvent::OutputItemDone(ResponseItem::WebSearchCall { id, status, action }) => {
+                assert_eq!(id.as_deref(), Some("srvtoolu_1"));
+                assert_eq!(status.as_deref(), Some("completed"));
+                assert_eq!(
+                    action,
+                    Some(WebSearchAction::Search {
+                        query: Some("latest codex cli release".to_string()),
+                        queries: None,
+                    })
+                );
+            }
+            event => panic!("expected WebSearchCall, got {event:?}"),
         }
     }
 
