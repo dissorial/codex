@@ -27,6 +27,7 @@ jobs:
       BUILD_PROFILE: dev-small
       TARGET: x86_64-unknown-linux-gnu
       ASSET_NAME: codex-app-server-x86_64-unknown-linux-gnu
+      CLI_ASSET_NAME: codex-x86_64-unknown-linux-gnu
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -59,7 +60,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo build --target "${TARGET}" --profile "${BUILD_PROFILE}" -p codex-app-server --bin codex-app-server
+          cargo build --target "${TARGET}" --profile "${BUILD_PROFILE}" \
+            -p codex-app-server --bin codex-app-server \
+            -p codex-cli --bin codex
 
       - name: Stage release asset
         id: stage
@@ -69,10 +72,15 @@ jobs:
           out_dir="${RUNNER_TEMP}/codex-agn-app-server"
           mkdir -p "${out_dir}"
           cp "target/${TARGET}/${BUILD_PROFILE}/codex-app-server" "${out_dir}/${ASSET_NAME}"
+          cp "target/${TARGET}/${BUILD_PROFILE}/codex" "${out_dir}/${CLI_ASSET_NAME}"
           chmod +x "${out_dir}/${ASSET_NAME}"
+          chmod +x "${out_dir}/${CLI_ASSET_NAME}"
           (cd "${out_dir}" && sha256sum "${ASSET_NAME}" > "${ASSET_NAME}.sha256")
+          (cd "${out_dir}" && sha256sum "${CLI_ASSET_NAME}" > "${CLI_ASSET_NAME}.sha256")
           echo "asset_path=${out_dir}/${ASSET_NAME}" >> "${GITHUB_OUTPUT}"
           echo "checksum_path=${out_dir}/${ASSET_NAME}.sha256" >> "${GITHUB_OUTPUT}"
+          echo "cli_asset_path=${out_dir}/${CLI_ASSET_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "cli_checksum_path=${out_dir}/${CLI_ASSET_NAME}.sha256" >> "${GITHUB_OUTPUT}"
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
@@ -81,6 +89,8 @@ jobs:
           path: |
             ${{ steps.stage.outputs.asset_path }}
             ${{ steps.stage.outputs.checksum_path }}
+            ${{ steps.stage.outputs.cli_asset_path }}
+            ${{ steps.stage.outputs.cli_checksum_path }}
           if-no-files-found: error
 
       - name: Publish GitHub release asset
@@ -90,6 +100,8 @@ jobs:
           RELEASE_TAG: ${{ inputs.release_tag || 'codex-agn-app-server-latest' }}
           ASSET_PATH: ${{ steps.stage.outputs.asset_path }}
           CHECKSUM_PATH: ${{ steps.stage.outputs.checksum_path }}
+          CLI_ASSET_PATH: ${{ steps.stage.outputs.cli_asset_path }}
+          CLI_CHECKSUM_PATH: ${{ steps.stage.outputs.cli_checksum_path }}
         run: |
           set -euo pipefail
           repo="${GITHUB_REPOSITORY}"
@@ -108,7 +120,9 @@ jobs:
             --repo "${repo}" \
             --clobber \
             "${ASSET_PATH}" \
-            "${CHECKSUM_PATH}"
+            "${CHECKSUM_PATH}" \
+            "${CLI_ASSET_PATH}" \
+            "${CLI_CHECKSUM_PATH}"
 
           {
             echo "### codex-agn app-server release"
@@ -118,4 +132,8 @@ jobs:
             echo "Asset URL:"
             echo
             echo "\`https://github.com/${repo}/releases/download/${RELEASE_TAG}/${ASSET_NAME}\`"
+            echo
+            echo "CLI asset URL:"
+            echo
+            echo "\`https://github.com/${repo}/releases/download/${RELEASE_TAG}/${CLI_ASSET_NAME}\`"
           } >> "${GITHUB_STEP_SUMMARY}"
