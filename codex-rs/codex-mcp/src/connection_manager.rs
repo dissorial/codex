@@ -625,7 +625,7 @@ impl McpConnectionManager {
         let all_tools = self.list_all_tools().await;
         all_tools
             .into_values()
-            .find(|tool| tool.canonical_tool_name() == *tool_name)
+            .find(|tool| tool.matches_model_tool_name(tool_name))
     }
 
     async fn client_by_name(&self, name: &str) -> Result<ManagedClient> {

@@ -51,6 +51,16 @@ impl ToolInfo {
     pub fn canonical_tool_name(&self) -> ToolName {
         ToolName::namespaced(self.callable_namespace.clone(), self.callable_name.clone())
     }
+
+    pub fn matches_model_tool_name(&self, tool_name: &ToolName) -> bool {
+        let canonical_tool_name = self.canonical_tool_name();
+        canonical_tool_name == *tool_name
+            || tool_name
+                .namespace
+                .is_none()
+                .then(|| canonical_tool_name.display() == tool_name.name)
+                .unwrap_or(false)
+    }
 }
 
 pub fn declared_openai_file_input_param_names(
