@@ -52,32 +52,37 @@ pub(crate) async fn stream_request<T: HttpTransport>(
 fn anthropic_request_body(request: &ResponsesApiRequest) -> Value {
     let mut body = json!({
         "anthropic_version": ANTHROPIC_VERSION,
-        "system": request.instructions,
         "max_tokens": MAX_OUTPUT_TOKENS,
         "messages": anthropic_messages(&request.input),
         "tools": anthropic_tools(&request.tools),
         "tool_choice": {"type": "auto"},
     });
+    if let Some(system) = anthropic_system(&request.instructions) {
+        body["system"] = system;
+    }
     if let Some(thinking) = anthropic_thinking(request) {
         body["thinking"] = thinking;
-    }
-    if let Some(output_config) = anthropic_output_config(request) {
-        body["output_config"] = output_config;
     }
     body
 }
 
-fn anthropic_thinking(request: &ResponsesApiRequest) -> Option<Value> {
-    anthropic_effort(request)?;
-    Some(json!({
-        "type": "adaptive",
-        "display": "summarized",
-    }))
+fn anthropic_system(instructions: &str) -> Option<Value> {
+    if instructions.is_empty() {
+        return None;
+    }
+    Some(json!([{
+        "type": "text",
+        "text": instructions,
+        "cache_control": {"type": "ephemeral"},
+    }]))
 }
 
-fn anthropic_output_config(request: &ResponsesApiRequest) -> Option<Value> {
+fn anthropic_thinking(request: &ResponsesApiRequest) -> Option<Value> {
     let effort = anthropic_effort(request)?;
-    Some(json!({ "effort": effort }))
+    Some(json!({
+        "type": "adaptive",
+        "effort": effort,
+    }))
 }
 
 fn anthropic_effort(request: &ResponsesApiRequest) -> Option<&'static str> {
@@ -223,10 +228,16 @@ fn function_output_text(body: &FunctionCallOutputBody) -> String {
 }
 
 fn anthropic_tools(tools: &[Value]) -> Vec<Value> {
-    tools
+    let mut converted: Vec<Value> = tools
         .iter()
         .flat_map(|tool| anthropic_tool(tool).unwrap_or_default())
-        .collect()
+        .collect();
+    if let Some(last) = converted.last_mut()
+        && let Some(last) = last.as_object_mut()
+    {
+        last.insert("cache_control".to_string(), json!({"type": "ephemeral"}));
+    }
+    converted
 }
 
 fn anthropic_tool(tool: &Value) -> Option<Vec<Value>> {
@@ -699,8 +710,25 @@ fn decode_bedrock_payload(payload: Vec<u8>) -> Vec<u8> {
 
 #[derive(Debug, Deserialize)]
 struct AnthropicUsage {
+    #[serde(default)]
     input_tokens: i64,
+    #[serde(default)]
     output_tokens: i64,
+    #[serde(
+        default,
+        alias = "cacheReadInputTokens",
+        alias = "CacheReadInputTokens"
+    )]
+    cache_read_input_tokens: i64,
+    #[serde(
+        default,
+        alias = "cacheCreationInputTokens",
+        alias = "CacheCreationInputTokens",
+        alias = "cache_write_input_tokens",
+        alias = "cacheWriteInputTokens",
+        alias = "CacheWriteInputTokens"
+    )]
+    cache_creation_input_tokens: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -710,12 +738,14 @@ struct AnthropicUsageDelta {
 
 impl From<AnthropicUsage> for TokenUsage {
     fn from(value: AnthropicUsage) -> Self {
+        let input_tokens =
+            value.input_tokens + value.cache_read_input_tokens + value.cache_creation_input_tokens;
         TokenUsage {
-            input_tokens: value.input_tokens,
-            cached_input_tokens: 0,
+            input_tokens,
+            cached_input_tokens: value.cache_read_input_tokens,
             output_tokens: value.output_tokens,
             reasoning_output_tokens: 0,
-            total_tokens: value.input_tokens + value.output_tokens,
+            total_tokens: input_tokens + value.output_tokens,
         }
     }
 }
@@ -723,6 +753,78 @@ impl From<AnthropicUsage> for TokenUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn request_with_instructions_and_tools(
+        instructions: impl Into<String>,
+        tools: Vec<Value>,
+    ) -> ResponsesApiRequest {
+        ResponsesApiRequest {
+            model: "global.anthropic.claude-opus-4-6-v1".to_string(),
+            instructions: instructions.into(),
+            input: vec![ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "hello".to_string(),
+                }],
+                end_turn: None,
+                phase: None,
+            }],
+            tools,
+            tool_choice: "auto".to_string(),
+            parallel_tool_calls: true,
+            reasoning: None,
+            store: false,
+            stream: false,
+            include: Vec::new(),
+            service_tier: None,
+            prompt_cache_key: None,
+            text: None,
+            client_metadata: None,
+        }
+    }
+
+    #[test]
+    fn anthropic_request_body_marks_system_prompt_for_cache() {
+        let request = request_with_instructions_and_tools("You are Codex.", Vec::new());
+
+        let body = anthropic_request_body(&request);
+
+        assert_eq!(body["system"][0]["type"], "text");
+        assert_eq!(body["system"][0]["text"], "You are Codex.");
+        assert_eq!(
+            body["system"][0]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+    }
+
+    #[test]
+    fn anthropic_request_body_marks_last_tool_for_cache() {
+        let request = request_with_instructions_and_tools(
+            "",
+            vec![
+                json!({
+                    "type": "function",
+                    "name": "first_tool",
+                    "description": "First tool",
+                    "parameters": {"type": "object"},
+                }),
+                json!({
+                    "type": "function",
+                    "name": "second_tool",
+                    "description": "Second tool",
+                    "parameters": {"type": "object"},
+                }),
+            ],
+        );
+
+        let body = anthropic_request_body(&request);
+
+        let tools = body["tools"].as_array().expect("tools array");
+        assert_eq!(tools.len(), 2);
+        assert!(tools[0].get("cache_control").is_none());
+        assert_eq!(tools[1]["cache_control"], json!({"type": "ephemeral"}));
+    }
 
     #[test]
     fn anthropic_messages_keeps_tool_result_immediately_after_tool_use() {
@@ -803,10 +905,27 @@ mod tests {
             body["thinking"],
             json!({
                 "type": "adaptive",
-                "display": "summarized",
+                "effort": "high",
             })
         );
-        assert_eq!(body["output_config"], json!({ "effort": "high" }));
+        assert!(body.get("output_config").is_none());
+    }
+
+    #[test]
+    fn anthropic_usage_maps_prompt_cache_tokens() {
+        let usage: TokenUsage = serde_json::from_value::<AnthropicUsage>(json!({
+            "input_tokens": 50,
+            "cache_read_input_tokens": 1000,
+            "cache_creation_input_tokens": 2000,
+            "output_tokens": 25,
+        }))
+        .unwrap()
+        .into();
+
+        assert_eq!(usage.input_tokens, 3050);
+        assert_eq!(usage.cached_input_tokens, 1000);
+        assert_eq!(usage.output_tokens, 25);
+        assert_eq!(usage.total_tokens, 3075);
     }
 
     #[tokio::test]
