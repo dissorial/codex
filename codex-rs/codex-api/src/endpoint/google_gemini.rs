@@ -327,7 +327,7 @@ fn gemini_tool_declarations(tool: &Value) -> Option<Vec<Value>> {
                         if let Some(name) = object.get("name").and_then(Value::as_str) {
                             object.insert(
                                 "name".to_string(),
-                                Value::String(format!("{namespace}__{name}")),
+                                Value::String(format!("{namespace}{name}")),
                             );
                         }
                         if let Some(description) = object.get("description").and_then(Value::as_str)
@@ -703,6 +703,26 @@ impl From<GeminiUsageMetadata> for TokenUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gemini_namespace_tools_use_canonical_display_names() {
+        let tools = gemini_tools(&[json!({
+            "type": "namespace",
+            "name": "mcp__delegento__",
+            "description": "Delegento tools",
+            "tools": [{
+                "type": "function",
+                "name": "google_ads_request",
+                "description": "Call Google Ads",
+                "parameters": {"type": "object"},
+            }],
+        })]);
+
+        assert_eq!(
+            tools[0]["functionDeclarations"][0]["name"],
+            "mcp__delegento__google_ads_request"
+        );
+    }
 
     #[test]
     fn gemini_contents_preserves_function_call_signature_metadata() {

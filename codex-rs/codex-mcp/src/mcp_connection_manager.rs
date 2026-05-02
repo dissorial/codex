@@ -165,6 +165,16 @@ impl ToolInfo {
     pub fn canonical_tool_name(&self) -> ToolName {
         ToolName::namespaced(self.callable_namespace.clone(), self.callable_name.clone())
     }
+
+    fn matches_model_tool_name(&self, tool_name: &ToolName) -> bool {
+        let canonical_tool_name = self.canonical_tool_name();
+        canonical_tool_name == *tool_name
+            || tool_name
+                .namespace
+                .is_none()
+                .then(|| canonical_tool_name.display() == tool_name.name)
+                .unwrap_or(false)
+    }
 }
 
 const META_OPENAI_FILE_PARAMS: &str = "openai/fileParams";
@@ -1224,7 +1234,7 @@ impl McpConnectionManager {
         let all_tools = self.list_all_tools().await;
         all_tools
             .into_values()
-            .find(|tool| tool.canonical_tool_name() == *tool_name)
+            .find(|tool| tool.matches_model_tool_name(tool_name))
     }
 }
 

@@ -345,6 +345,20 @@ fn test_qualify_tools_keeps_hyphenated_mcp_tools_callable() {
 }
 
 #[test]
+fn test_tool_info_matches_flat_model_visible_name() {
+    let tool = create_test_tool("delegento", "google_ads_request");
+
+    assert!(tool.matches_model_tool_name(&ToolName::namespaced(
+        "mcp__delegento__",
+        "google_ads_request",
+    )));
+    assert!(tool.matches_model_tool_name(&ToolName::plain("mcp__delegento__google_ads_request")));
+    assert!(
+        !tool.matches_model_tool_name(&ToolName::plain("mcp__delegento____google_ads_request"))
+    );
+}
+
+#[test]
 fn test_qualify_tools_disambiguates_sanitized_namespace_collisions() {
     let tools = vec![
         create_test_tool("basic-server", "lookup"),
