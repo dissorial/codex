@@ -261,7 +261,7 @@ fn anthropic_tool(tool: &Value) -> Option<Vec<Value>> {
                         if let Some(name) = object.get("name").and_then(Value::as_str) {
                             object.insert(
                                 "name".to_string(),
-                                Value::String(format!("{namespace}__{name}")),
+                                Value::String(format!("{namespace}{name}")),
                             );
                         }
                         if let Some(description) = object.get("description").and_then(Value::as_str)
@@ -826,6 +826,23 @@ mod tests {
         assert_eq!(tools.len(), 2);
         assert!(tools[0].get("cache_control").is_none());
         assert_eq!(tools[1]["cache_control"], json!({"type": "ephemeral"}));
+    }
+
+    #[test]
+    fn anthropic_namespace_tools_use_canonical_display_names() {
+        let tools = anthropic_tools(&[json!({
+            "type": "namespace",
+            "name": "mcp__delegento__",
+            "description": "Delegento tools",
+            "tools": [{
+                "type": "function",
+                "name": "google_ads_request",
+                "description": "Call Google Ads",
+                "parameters": {"type": "object"},
+            }],
+        })]);
+
+        assert_eq!(tools[0]["name"], "mcp__delegento__google_ads_request");
     }
 
     #[test]
