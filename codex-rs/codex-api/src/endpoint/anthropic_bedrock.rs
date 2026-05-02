@@ -63,6 +63,9 @@ fn anthropic_request_body(request: &ResponsesApiRequest) -> Value {
     if let Some(thinking) = anthropic_thinking(request) {
         body["thinking"] = thinking;
     }
+    if let Some(effort) = anthropic_effort(request) {
+        body["output_config"] = json!({ "effort": effort });
+    }
     body
 }
 
@@ -78,10 +81,9 @@ fn anthropic_system(instructions: &str) -> Option<Value> {
 }
 
 fn anthropic_thinking(request: &ResponsesApiRequest) -> Option<Value> {
-    let effort = anthropic_effort(request)?;
+    anthropic_effort(request)?;
     Some(json!({
         "type": "adaptive",
-        "effort": effort,
     }))
 }
 
@@ -901,14 +903,8 @@ mod tests {
 
         let body = anthropic_request_body(&request);
 
-        assert_eq!(
-            body["thinking"],
-            json!({
-                "type": "adaptive",
-                "effort": "high",
-            })
-        );
-        assert!(body.get("output_config").is_none());
+        assert_eq!(body["thinking"], json!({ "type": "adaptive" }));
+        assert_eq!(body["output_config"], json!({ "effort": "high" }));
     }
 
     #[test]
