@@ -19,12 +19,12 @@ jobs:
   build-linux:
     name: Build Linux app-server
     runs-on: ubuntu-22.04
-    timeout-minutes: 45
+    timeout-minutes: 90
     defaults:
       run:
         working-directory: codex-rs
     env:
-      BUILD_PROFILE: dev-small
+      BUILD_PROFILE: release
       TARGET: x86_64-unknown-linux-gnu
       ASSET_NAME: codex-app-server-x86_64-unknown-linux-gnu
       CLI_ASSET_NAME: codex-x86_64-unknown-linux-gnu
