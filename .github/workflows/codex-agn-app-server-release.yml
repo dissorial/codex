@@ -24,7 +24,7 @@ jobs:
       run:
         working-directory: codex-rs
     env:
-      BUILD_PROFILE: release
+      BUILD_PROFILE: sandbox-release
       TARGET: x86_64-unknown-linux-gnu
       ASSET_NAME: codex-app-server-x86_64-unknown-linux-gnu
       CLI_ASSET_NAME: codex-x86_64-unknown-linux-gnu
