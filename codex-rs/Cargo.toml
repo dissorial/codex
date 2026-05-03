@@ -465,6 +465,15 @@ strip = "symbols"
 # See https://github.com/openai/codex/issues/1411 for details.
 codegen-units = 1
 
+[profile.sandbox-release]
+inherits = "release"
+# Keep the Vercel sandbox artifacts optimized and stripped without the memory
+# pressure of the full release profile's fat LTO/codegen settings in CI.
+lto = false
+codegen-units = 16
+debug = 0
+strip = "symbols"
+
 [profile.ci-test]
 debug = 1         # Reduce debug symbol size
 inherits = "test"
