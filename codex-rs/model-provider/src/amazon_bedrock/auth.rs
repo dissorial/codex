@@ -11,7 +11,6 @@ use codex_client::RequestBody;
 use codex_client::RequestCompression;
 use codex_model_provider_info::ModelProviderAwsAuthInfo;
 use codex_model_provider_info::ModelProviderInfo;
-use codex_model_provider_info::ModelProviderInfo;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result;
 use http::HeaderMap;

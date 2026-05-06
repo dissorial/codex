@@ -482,10 +482,14 @@ fn response_stream_from_sse(bytes: codex_client::ByteStream) -> ResponseStream {
                     .response_id
                     .unwrap_or_else(|| "gemini-response".to_string()),
                 token_usage: state.usage_metadata.map(Into::into),
+                end_turn: None,
             }))
             .await;
     });
-    ResponseStream { rx_event }
+    ResponseStream {
+        rx_event,
+        upstream_request_id: None,
+    }
 }
 
 #[derive(Default)]
@@ -582,7 +586,6 @@ async fn send_gemini_streaming_output_text_delta(
             content: vec![ContentItem::OutputText {
                 text: String::new(),
             }],
-            end_turn: None,
             phase: None,
         };
         tx_event
@@ -610,7 +613,6 @@ async fn flush_gemini_streaming_output_text(
         content: vec![ContentItem::OutputText {
             text: std::mem::take(&mut state.output_text),
         }],
-        end_turn: None,
         phase: None,
     };
     state.text_open = false;
@@ -733,7 +735,6 @@ mod tests {
                 content: vec![ContentItem::InputText {
                     text: "make a file".to_string(),
                 }],
-                end_turn: None,
                 phase: None,
             },
             ResponseItem::Reasoning {

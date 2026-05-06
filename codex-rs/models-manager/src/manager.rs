@@ -32,6 +32,12 @@ pub trait ModelsEndpointClient: fmt::Debug + Send + Sync {
     /// Returns whether this provider can authenticate command-scoped requests.
     fn has_command_auth(&self) -> bool;
 
+    /// Returns whether this provider has non-Codex auth configured for its own
+    /// `/models` endpoint.
+    fn has_provider_auth(&self) -> bool {
+        false
+    }
+
     /// Returns whether the currently resolved auth can use Codex backend-only models.
     async fn uses_codex_backend(&self) -> bool;
 
@@ -318,7 +324,9 @@ impl OpenAiModelsManager {
     }
 
     async fn should_refresh_models(&self) -> bool {
-        self.endpoint_client.uses_codex_backend().await || self.endpoint_client.has_command_auth()
+        self.endpoint_client.uses_codex_backend().await
+            || self.endpoint_client.has_command_auth()
+            || self.endpoint_client.has_provider_auth()
     }
 
     async fn get_etag(&self) -> Option<String> {

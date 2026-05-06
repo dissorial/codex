@@ -2880,6 +2880,13 @@ impl codex_thread_store::ThreadStore for CountingThreadStore {
         unimplemented!("not needed for shutdown persistence regression test")
     }
 
+    async fn read_thread_by_rollout_path(
+        &self,
+        _params: codex_thread_store::ReadThreadByRolloutPathParams,
+    ) -> codex_thread_store::ThreadStoreResult<codex_thread_store::StoredThread> {
+        unimplemented!("not needed for shutdown persistence regression test")
+    }
+
     async fn list_threads(
         &self,
         _params: codex_thread_store::ListThreadsParams,
@@ -2913,6 +2920,7 @@ impl codex_thread_store::ThreadStore for CountingThreadStore {
 async fn shutdown_complete_is_delivered_after_thread_persistence_shutdown_without_appending() {
     let (session, _turn_context, rx_event) = make_session_and_context_with_rx().await;
     let store = Arc::new(CountingThreadStore::default());
+    let config = session.get_config().await;
     let live_thread = LiveThread::create(
         store.clone(),
         CreateThreadParams {
@@ -2921,6 +2929,15 @@ async fn shutdown_complete_is_delivered_after_thread_persistence_shutdown_withou
             source: SessionSource::Exec,
             base_instructions: BaseInstructions::default(),
             dynamic_tools: Vec::new(),
+            metadata: ThreadPersistenceMetadata {
+                cwd: Some(config.cwd.to_path_buf()),
+                model_provider: config.model_provider_id.clone(),
+                memory_mode: if config.memories.generate_memories {
+                    ThreadMemoryMode::Enabled
+                } else {
+                    ThreadMemoryMode::Disabled
+                },
+            },
             event_persistence_mode: ThreadEventPersistenceMode::Limited,
         },
     )

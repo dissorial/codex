@@ -139,7 +139,7 @@ pub struct ModelProviderInfo {
 }
 
 /// AWS SigV4 auth configuration for a model provider.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct ModelProviderAwsAuthInfo {
     /// AWS profile name to use. When unset, the AWS SDK default chain decides.

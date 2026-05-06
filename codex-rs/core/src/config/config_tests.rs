@@ -530,7 +530,7 @@ region = "us-west-2"
 
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     assert!(err.to_string().contains(
-        "model_providers.amazon-bedrock only supports changing `aws.profile` and `aws.region`; other non-default provider fields are not supported"
+        "model_providers.amazon-bedrock only supports changing `aws.profile`, `aws.region`, `aws.access_key_id`, `aws.secret_access_key`, and `aws.session_token`; other non-default provider fields are not supported"
     ));
 }
 
@@ -6568,7 +6568,7 @@ async fn test_precedence_fixture_with_o3_profile() -> std::io::Result<()> {
             mcp_servers: Constrained::allow_any(HashMap::new()),
             mcp_oauth_credentials_store_mode: resolve_mcp_oauth_credentials_store_mode(
                 Default::default(),
-                LOCAL_DEV_BUILD_VERSION,
+                env!("CARGO_PKG_VERSION"),
             ),
             mcp_oauth_callback_port: None,
             mcp_oauth_callback_url: None,
@@ -6773,7 +6773,7 @@ async fn test_precedence_fixture_with_gpt3_profile() -> std::io::Result<()> {
         mcp_servers: Constrained::allow_any(HashMap::new()),
         mcp_oauth_credentials_store_mode: resolve_mcp_oauth_credentials_store_mode(
             Default::default(),
-            LOCAL_DEV_BUILD_VERSION,
+            env!("CARGO_PKG_VERSION"),
         ),
         mcp_oauth_callback_port: None,
         mcp_oauth_callback_url: None,
@@ -6932,7 +6932,7 @@ async fn test_precedence_fixture_with_zdr_profile() -> std::io::Result<()> {
         mcp_servers: Constrained::allow_any(HashMap::new()),
         mcp_oauth_credentials_store_mode: resolve_mcp_oauth_credentials_store_mode(
             Default::default(),
-            LOCAL_DEV_BUILD_VERSION,
+            env!("CARGO_PKG_VERSION"),
         ),
         mcp_oauth_callback_port: None,
         mcp_oauth_callback_url: None,
@@ -7076,7 +7076,7 @@ async fn test_precedence_fixture_with_gpt5_profile() -> std::io::Result<()> {
         mcp_servers: Constrained::allow_any(HashMap::new()),
         mcp_oauth_credentials_store_mode: resolve_mcp_oauth_credentials_store_mode(
             Default::default(),
-            LOCAL_DEV_BUILD_VERSION,
+            env!("CARGO_PKG_VERSION"),
         ),
         mcp_oauth_callback_port: None,
         mcp_oauth_callback_url: None,

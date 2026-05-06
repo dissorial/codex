@@ -348,7 +348,10 @@ fn response_stream_from_eventstream(mut bytes: codex_client::ByteStream) -> Resp
                 .await;
         }
     });
-    ResponseStream { rx_event }
+    ResponseStream {
+        rx_event,
+        upstream_request_id: None,
+    }
 }
 
 #[derive(Default)]
@@ -504,6 +507,7 @@ async fn process_anthropic_stream_event(
                 .send(Ok(ResponseEvent::Completed {
                     response_id,
                     token_usage: state.usage.clone(),
+                    end_turn: None,
                 }))
                 .await
                 .map_err(|_| ())?;
@@ -539,7 +543,6 @@ async fn send_streaming_output_text_delta(
             content: vec![ContentItem::OutputText {
                 text: String::new(),
             }],
-            end_turn: None,
             phase: None,
         };
         tx_event
@@ -567,7 +570,6 @@ async fn flush_streaming_output_text(
         content: vec![ContentItem::OutputText {
             text: std::mem::take(&mut state.output_text),
         }],
-        end_turn: None,
         phase: None,
     };
     state.text_open = false;
@@ -769,7 +771,6 @@ mod tests {
                 content: vec![ContentItem::InputText {
                     text: "hello".to_string(),
                 }],
-                end_turn: None,
                 phase: None,
             }],
             tools,
@@ -854,7 +855,6 @@ mod tests {
                 content: vec![ContentItem::InputText {
                     text: "make a file".to_string(),
                 }],
-                end_turn: None,
                 phase: None,
             },
             ResponseItem::Message {
@@ -863,7 +863,6 @@ mod tests {
                 content: vec![ContentItem::OutputText {
                     text: "I'll do that.".to_string(),
                 }],
-                end_turn: None,
                 phase: None,
             },
             ResponseItem::FunctionCall {
@@ -899,7 +898,6 @@ mod tests {
                 content: vec![ContentItem::InputText {
                     text: "think".to_string(),
                 }],
-                end_turn: None,
                 phase: None,
             }],
             tools: Vec::new(),
@@ -1021,6 +1019,7 @@ mod tests {
             ResponseEvent::Completed {
                 response_id,
                 token_usage,
+                end_turn: None,
             } => {
                 assert_eq!(response_id, "msg_bedrock");
                 let token_usage = token_usage.unwrap();

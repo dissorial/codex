@@ -739,7 +739,13 @@ async fn static_manager_reads_latest_auth_mode() {
             .iter()
             .map(|model| model.model.as_str())
             .collect::<Vec<_>>(),
-        vec!["chatgpt-only", "api-model"]
+        vec![
+            "chatgpt-only",
+            "api-model",
+            "gemini-3.1-pro-preview-customtools",
+            "global.anthropic.claude-opus-4-6-v1",
+            "us.anthropic.claude-opus-4-6-v1",
+        ]
     );
 
     auth_manager.set_external_auth(Arc::new(TestExternalApiKeyAuth));
@@ -750,7 +756,12 @@ async fn static_manager_reads_latest_auth_mode() {
             .iter()
             .map(|model| model.model.as_str())
             .collect::<Vec<_>>(),
-        vec!["api-model"]
+        vec![
+            "api-model",
+            "gemini-3.1-pro-preview-customtools",
+            "global.anthropic.claude-opus-4-6-v1",
+            "us.anthropic.claude-opus-4-6-v1",
+        ]
     );
 }
 

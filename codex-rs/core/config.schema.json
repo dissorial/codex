@@ -1304,12 +1304,24 @@
       "additionalProperties": false,
       "description": "AWS SigV4 auth configuration for a model provider.",
       "properties": {
+        "access_key_id": {
+          "description": "Static AWS access key ID to use for this provider.",
+          "type": "string"
+        },
         "profile": {
           "description": "AWS profile name to use. When unset, the AWS SDK default chain decides.",
           "type": "string"
         },
         "region": {
           "description": "AWS region to use for provider-specific endpoints.",
+          "type": "string"
+        },
+        "secret_access_key": {
+          "description": "Static AWS secret access key to use for this provider.",
+          "type": "string"
+        },
+        "session_token": {
+          "description": "Optional AWS session token to use with static credentials.",
           "type": "string"
         }
       },
@@ -4317,6 +4329,14 @@
     "model_provider": {
       "description": "Provider to use from the model_providers map.",
       "type": "string"
+    },
+    "model_provider_routes": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "default": {},
+      "description": "Optional model slug to provider-id routes. Exact model slugs are supported, and keys ending in `*` are treated as prefix routes.",
+      "type": "object"
     },
     "model_providers": {
       "additionalProperties": {
