@@ -7,6 +7,7 @@ use super::X_CODEX_PARENT_THREAD_ID_HEADER;
 use super::X_CODEX_TURN_METADATA_HEADER;
 use super::X_CODEX_WINDOW_ID_HEADER;
 use super::X_OPENAI_SUBAGENT_HEADER;
+use super::tools_for_provider;
 use codex_app_server_protocol::AuthMode;
 use codex_model_provider::BearerAuthProvider;
 use codex_model_provider_info::WireApi;
@@ -16,8 +17,14 @@ use codex_protocol::ThreadId;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
+use codex_tools::JsonSchema;
+use codex_tools::ResponsesApiNamespace;
+use codex_tools::ResponsesApiNamespaceTool;
+use codex_tools::ResponsesApiTool;
+use codex_tools::ToolSpec;
 use pretty_assertions::assert_eq;
 use serde_json::json;
+use std::collections::BTreeMap;
 
 fn test_model_client(session_source: SessionSource) -> ModelClient {
     let provider = create_oss_provider_with_base_url("https://example.com/v1", WireApi::Responses);
@@ -77,6 +84,59 @@ fn test_session_telemetry() -> SessionTelemetry {
         "test-terminal".to_string(),
         SessionSource::Cli,
     )
+}
+
+fn namespace_tool_spec() -> ToolSpec {
+    ToolSpec::Namespace(ResponsesApiNamespace {
+        name: "mcp__delegento__".to_string(),
+        description: "Delegento tools".to_string(),
+        tools: vec![ResponsesApiNamespaceTool::Function(ResponsesApiTool {
+            name: "google_ads_request".to_string(),
+            description: "Call Google Ads".to_string(),
+            strict: false,
+            defer_loading: None,
+            parameters: JsonSchema::object(
+                BTreeMap::from([("query".to_string(), JsonSchema::string(None))]),
+                None,
+                None,
+            ),
+            output_schema: None,
+        })],
+    })
+}
+
+#[test]
+fn tools_for_provider_keeps_namespaces_for_responses_api_providers() {
+    let provider = create_oss_provider_with_base_url("https://example.com/v1", WireApi::Responses)
+        .to_api_provider(None)
+        .expect("provider");
+    let tools = vec![namespace_tool_spec()];
+
+    assert_eq!(tools_for_provider(&provider, &tools), tools);
+}
+
+#[test]
+fn tools_for_provider_flattens_namespaces_for_bedrock_claude_and_gemini() {
+    let provider =
+        codex_model_provider_info::ModelProviderInfo::create_amazon_bedrock_claude_provider(None)
+            .to_api_provider(None)
+            .expect("provider");
+    assert_flattens_namespace_tools(&provider);
+
+    let provider = codex_model_provider_info::ModelProviderInfo::create_google_gemini_provider()
+        .to_api_provider(None)
+        .expect("provider");
+    assert_flattens_namespace_tools(&provider);
+}
+
+fn assert_flattens_namespace_tools(provider: &codex_api::Provider) {
+    let tools = tools_for_provider(provider, &[namespace_tool_spec()]);
+    assert_eq!(tools.len(), 1);
+    let ToolSpec::Function(tool) = &tools[0] else {
+        panic!("expected flattened function tool");
+    };
+    assert_eq!(tool.name, "mcp__delegento__google_ads_request");
+    assert_eq!(tool.description, "Delegento tools\n\nCall Google Ads");
 }
 
 #[test]

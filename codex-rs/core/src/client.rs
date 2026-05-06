@@ -83,6 +83,8 @@ use codex_protocol::protocol::W3cTraceContext;
 use codex_rollout_trace::CompactionTraceContext;
 use codex_rollout_trace::InferenceTraceAttempt;
 use codex_rollout_trace::InferenceTraceContext;
+use codex_tools::ResponsesApiNamespaceTool;
+use codex_tools::ToolSpec;
 use codex_tools::create_tools_json_for_responses_api;
 use eventsource_stream::Event;
 use eventsource_stream::EventStreamError;
@@ -471,13 +473,13 @@ impl ModelClient {
             RequestRouteTelemetry::for_endpoint(RESPONSES_COMPACT_ENDPOINT),
             self.state.auth_env_telemetry.clone(),
         );
+        let instructions = prompt.base_instructions.text.clone();
+        let input = prompt.get_formatted_input();
+        let provider_tools = tools_for_provider(&client_setup.api_provider, &prompt.tools);
+        let tools = create_tools_json_for_responses_api(&provider_tools)?;
         let client =
             ApiCompactClient::new(transport, client_setup.api_provider, client_setup.api_auth)
                 .with_telemetry(Some(request_telemetry));
-
-        let instructions = prompt.base_instructions.text.clone();
-        let input = prompt.get_formatted_input();
-        let tools = create_tools_json_for_responses_api(&prompt.tools)?;
         let reasoning = Self::build_reasoning(model_info, effort, summary);
         let verbosity = if model_info.support_verbosity {
             self.state.model_verbosity.or(model_info.default_verbosity)
@@ -849,6 +851,39 @@ impl ModelClient {
     }
 }
 
+fn tools_for_provider(provider: &codex_api::Provider, tools: &[ToolSpec]) -> Vec<ToolSpec> {
+    if provider_supports_responses_api_namespaces(provider) {
+        return tools.to_vec();
+    }
+
+    tools
+        .iter()
+        .flat_map(|tool| match tool {
+            ToolSpec::Namespace(namespace) => namespace
+                .tools
+                .iter()
+                .map(|tool| match tool {
+                    ResponsesApiNamespaceTool::Function(function) => {
+                        let mut function = function.clone();
+                        function.name = format!("{}{}", namespace.name, function.name);
+                        let namespace_description = namespace.description.trim();
+                        if !namespace_description.is_empty() {
+                            function.description =
+                                format!("{namespace_description}\n\n{}", function.description);
+                        }
+                        ToolSpec::Function(function)
+                    }
+                })
+                .collect::<Vec<_>>(),
+            tool => vec![tool.clone()],
+        })
+        .collect()
+}
+
+fn provider_supports_responses_api_namespaces(provider: &codex_api::Provider) -> bool {
+    !provider.is_anthropic_bedrock_claude_endpoint() && !provider.is_google_gemini_endpoint()
+}
+
 impl Drop for ModelClientSession {
     fn drop(&mut self) {
         let websocket_session = std::mem::take(&mut self.websocket_session);
@@ -881,7 +916,8 @@ impl ModelClientSession {
     ) -> Result<ResponsesApiRequest> {
         let instructions = &prompt.base_instructions.text;
         let input = prompt.get_formatted_input();
-        let tools = create_tools_json_for_responses_api(&prompt.tools)?;
+        let provider_tools = tools_for_provider(provider, &prompt.tools);
+        let tools = create_tools_json_for_responses_api(&provider_tools)?;
         let default_reasoning_effort = model_info.default_reasoning_level;
         let reasoning = if model_info.supports_reasoning_summaries {
             Some(Reasoning {
