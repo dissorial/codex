@@ -131,7 +131,6 @@ fn gemini_31_pro_model_info(slug: &str) -> ModelInfo {
         description: Some("Google Gemini 3.1 Pro Preview through the Gemini API.".to_string()),
         default_reasoning_level: Some(ReasoningEffort::High),
         supported_reasoning_levels: vec![
-            reasoning_preset(ReasoningEffort::Minimal, "minimal"),
             reasoning_preset(ReasoningEffort::Low, "low"),
             reasoning_preset(ReasoningEffort::Medium, "medium"),
             reasoning_preset(ReasoningEffort::High, "high"),
@@ -161,7 +160,7 @@ fn gemini_31_pro_model_info(slug: &str) -> ModelInfo {
         experimental_supported_tools: Vec::new(),
         input_modalities: default_input_modalities(),
         used_fallback_model_metadata: false,
-        supports_search_tool: false,
+        supports_search_tool: true,
     }
 }
 

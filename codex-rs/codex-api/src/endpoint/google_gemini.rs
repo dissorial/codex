@@ -1,15 +1,18 @@
+use crate::common::Reasoning;
 use crate::common::ResponseEvent;
 use crate::common::ResponseStream;
 use crate::common::ResponsesApiRequest;
 use crate::endpoint::session::EndpointSession;
 use crate::error::ApiError;
 use codex_client::HttpTransport;
+use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ReasoningItemReasoningSummary;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::models::WebSearchAction;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::TokenUsage;
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
@@ -17,6 +20,7 @@ use http::HeaderMap;
 use http::HeaderValue;
 use http::Method;
 use serde::Deserialize;
+use serde::Serialize;
 use serde_json::Map;
 use serde_json::Value;
 use serde_json::json;
@@ -51,6 +55,11 @@ pub(crate) async fn stream_request<T: HttpTransport>(
 
 fn gemini_request_body(request: &ResponsesApiRequest) -> Value {
     let uses_web_search = request.tools.iter().any(is_web_search_tool);
+    let mut generation_config = Map::new();
+    generation_config.insert("maxOutputTokens".to_string(), json!(MAX_OUTPUT_TOKENS));
+    if let Some(thinking_config) = gemini_thinking_config(request.reasoning.as_ref()) {
+        generation_config.insert("thinkingConfig".to_string(), thinking_config);
+    }
     json!({
         "systemInstruction": {
             "parts": gemini_text_parts(&request.instructions),
@@ -60,12 +69,10 @@ fn gemini_request_body(request: &ResponsesApiRequest) -> Value {
         "toolConfig": {
             "includeServerSideToolInvocations": uses_web_search,
             "functionCallingConfig": {
-                "mode": "AUTO",
+                "mode": if uses_web_search { "VALIDATED" } else { "AUTO" },
             }
         },
-        "generationConfig": {
-            "maxOutputTokens": MAX_OUTPUT_TOKENS,
-        },
+        "generationConfig": Value::Object(generation_config),
     })
 }
 
@@ -77,8 +84,39 @@ fn gemini_text_parts(text: &str) -> Vec<Value> {
     }
 }
 
+fn gemini_thinking_config(reasoning: Option<&Reasoning>) -> Option<Value> {
+    let reasoning = reasoning?;
+    let mut thinking_config = Map::new();
+    if let Some(thinking_level) = gemini_thinking_level(reasoning.effort) {
+        thinking_config.insert(
+            "thinkingLevel".to_string(),
+            Value::String(thinking_level.to_string()),
+        );
+    }
+    if reasoning
+        .summary
+        .is_some_and(|summary| summary != ReasoningSummary::None)
+    {
+        thinking_config.insert("includeThoughts".to_string(), Value::Bool(true));
+    }
+    if thinking_config.is_empty() {
+        None
+    } else {
+        Some(Value::Object(thinking_config))
+    }
+}
+
+fn gemini_thinking_level(effort: Option<ReasoningEffort>) -> Option<&'static str> {
+    match effort {
+        Some(ReasoningEffort::Low) => Some("low"),
+        Some(ReasoningEffort::Medium) => Some("medium"),
+        Some(ReasoningEffort::High | ReasoningEffort::XHigh) => Some("high"),
+        Some(ReasoningEffort::None | ReasoningEffort::Minimal) | None => None,
+    }
+}
+
 fn gemini_contents(items: &[ResponseItem]) -> Vec<Value> {
-    let signatures = gemini_function_call_signatures(items);
+    let mut signature_metadata = gemini_signature_metadata(items);
     let call_names = gemini_function_call_names(items);
     let mut contents = Vec::new();
     let mut pending_model_parts = Vec::new();
@@ -93,7 +131,19 @@ fn gemini_contents(items: &[ResponseItem]) -> Vec<Value> {
                     &mut pending_function_response_parts,
                 );
                 let role = if role == "assistant" { "model" } else { "user" };
-                push_content(&mut contents, role, gemini_message_parts(content));
+                let mut parts = gemini_message_parts(
+                    content,
+                    role == "model",
+                    &mut signature_metadata.text_part_signatures,
+                );
+                if role == "model" {
+                    prepend_server_tool_parts_for_message(
+                        content,
+                        &mut signature_metadata,
+                        &mut parts,
+                    );
+                }
+                push_content(&mut contents, role, parts);
             }
             ResponseItem::FunctionCall {
                 call_id,
@@ -102,11 +152,16 @@ fn gemini_contents(items: &[ResponseItem]) -> Vec<Value> {
                 ..
             } => {
                 let args = serde_json::from_str(arguments).unwrap_or(Value::Object(Map::new()));
+                append_server_tool_parts_for_call(
+                    &mut pending_model_parts,
+                    &mut signature_metadata,
+                    call_id,
+                );
                 pending_model_parts.push(function_call_part(
                     call_id,
                     name,
                     args,
-                    signatures.get(call_id),
+                    signature_metadata.function_call_signatures.get(call_id),
                 ));
             }
             ResponseItem::CustomToolCall {
@@ -116,11 +171,16 @@ fn gemini_contents(items: &[ResponseItem]) -> Vec<Value> {
                 ..
             } => {
                 let args = serde_json::from_str(input).unwrap_or(Value::String(input.clone()));
+                append_server_tool_parts_for_call(
+                    &mut pending_model_parts,
+                    &mut signature_metadata,
+                    call_id,
+                );
                 pending_model_parts.push(function_call_part(
                     call_id,
                     name,
                     args,
-                    signatures.get(call_id),
+                    signature_metadata.function_call_signatures.get(call_id),
                 ));
             }
             ResponseItem::FunctionCallOutput { call_id, output } => {
@@ -185,12 +245,84 @@ fn push_content(contents: &mut Vec<Value>, role: &str, parts: Vec<Value>) {
     contents.push(json!({"role": role, "parts": parts}));
 }
 
-fn gemini_message_parts(content: &[ContentItem]) -> Vec<Value> {
+fn prepend_server_tool_parts_for_message(
+    content: &[ContentItem],
+    metadata: &mut GeminiSignatureMetadata,
+    message_parts: &mut Vec<Value>,
+) {
+    let Some(text) = gemini_output_text_key(content) else {
+        if !metadata.orphan_server_tool_parts.is_empty() {
+            let mut server_parts = std::mem::take(&mut metadata.orphan_server_tool_parts);
+            server_parts.append(message_parts);
+            *message_parts = server_parts;
+        }
+        return;
+    };
+    let Some(position) = metadata
+        .server_tool_parts_by_text
+        .iter()
+        .position(|entry| entry.text == text)
+    else {
+        if !metadata.orphan_server_tool_parts.is_empty() {
+            let mut server_parts = std::mem::take(&mut metadata.orphan_server_tool_parts);
+            server_parts.append(message_parts);
+            *message_parts = server_parts;
+        }
+        return;
+    };
+    let mut server_parts = metadata.server_tool_parts_by_text.remove(position).parts;
+    server_parts.append(message_parts);
+    *message_parts = server_parts;
+}
+
+fn append_server_tool_parts_for_call(
+    pending_model_parts: &mut Vec<Value>,
+    metadata: &mut GeminiSignatureMetadata,
+    call_id: &str,
+) {
+    if let Some(mut server_parts) = metadata.server_tool_parts_by_call_id.remove(call_id) {
+        pending_model_parts.append(&mut server_parts);
+    } else if !metadata.orphan_server_tool_parts.is_empty() {
+        pending_model_parts.append(&mut metadata.orphan_server_tool_parts);
+    }
+}
+
+fn gemini_output_text_key(content: &[ContentItem]) -> Option<String> {
+    let text = content
+        .iter()
+        .filter_map(|item| match item {
+            ContentItem::OutputText { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    if text.is_empty() { None } else { Some(text) }
+}
+
+fn gemini_message_parts(
+    content: &[ContentItem],
+    preserve_text_signatures: bool,
+    text_signatures: &mut Vec<GeminiTextPartSignature>,
+) -> Vec<Value> {
     let mut parts = Vec::new();
     for item in content {
         match item {
             ContentItem::InputText { text } | ContentItem::OutputText { text } => {
-                parts.push(json!({"text": text}));
+                let mut part = json!({"text": text});
+                if preserve_text_signatures
+                    && let ContentItem::OutputText { .. } = item
+                    && let Some(position) = text_signatures
+                        .iter()
+                        .position(|signature| signature.text == *text)
+                {
+                    let signature = text_signatures.remove(position);
+                    if let Some(object) = part.as_object_mut() {
+                        object.insert(
+                            "thoughtSignature".to_string(),
+                            Value::String(signature.thought_signature),
+                        );
+                    }
+                }
+                parts.push(part);
             }
             ContentItem::InputImage { image_url, .. } => {
                 if let Some((mime_type, data)) = image_url
@@ -268,8 +400,8 @@ fn gemini_function_call_names(items: &[ResponseItem]) -> HashMap<String, String>
     names
 }
 
-fn gemini_function_call_signatures(items: &[ResponseItem]) -> HashMap<String, String> {
-    let mut signatures = HashMap::new();
+fn gemini_signature_metadata(items: &[ResponseItem]) -> GeminiSignatureMetadata {
+    let mut metadata = GeminiSignatureMetadata::default();
     for item in items {
         let ResponseItem::Reasoning {
             encrypted_content: Some(encrypted_content),
@@ -281,12 +413,18 @@ fn gemini_function_call_signatures(items: &[ResponseItem]) -> HashMap<String, St
         let Some(json) = encrypted_content.strip_prefix(SIGNATURE_METADATA_PREFIX) else {
             continue;
         };
-        let Ok(parsed) = serde_json::from_str::<HashMap<String, String>>(json) else {
+        if let Ok(function_call_signatures) = serde_json::from_str::<HashMap<String, String>>(json)
+        {
+            metadata
+                .function_call_signatures
+                .extend(function_call_signatures);
             continue;
-        };
-        signatures.extend(parsed);
+        }
+        if let Ok(parsed) = serde_json::from_str::<GeminiSignatureMetadata>(json) {
+            metadata.merge(parsed);
+        }
     }
-    signatures
+    metadata
 }
 
 fn gemini_tools(tools: &[Value]) -> Vec<Value> {
@@ -471,6 +609,17 @@ fn response_stream_from_sse(bytes: codex_client::ByteStream) -> ResponseStream {
         {
             return;
         }
+        if !state.pending_server_tool_parts.is_empty() {
+            state
+                .signature_metadata
+                .orphan_server_tool_parts
+                .append(&mut state.pending_server_tool_parts);
+        }
+        if !state.reasoning_summary_text.is_empty() {
+            let item =
+                gemini_reasoning_summary_item(std::mem::take(&mut state.reasoning_summary_text));
+            let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
+        }
         if !state.signature_metadata.is_empty() {
             let item =
                 gemini_signature_reasoning_item(std::mem::take(&mut state.signature_metadata));
@@ -492,10 +641,64 @@ fn response_stream_from_sse(bytes: codex_client::ByteStream) -> ResponseStream {
 struct GeminiStreamState {
     response_id: Option<String>,
     usage_metadata: Option<GeminiUsageMetadata>,
-    signature_metadata: HashMap<String, String>,
+    signature_metadata: GeminiSignatureMetadata,
+    pending_server_tool_parts: Vec<Value>,
+    pending_text_thought_signature: Option<String>,
+    reasoning_summary_text: String,
     text_open: bool,
     text_block_index: u32,
     output_text: String,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct GeminiSignatureMetadata {
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    function_call_signatures: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    text_part_signatures: Vec<GeminiTextPartSignature>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    server_tool_parts_by_call_id: HashMap<String, Vec<Value>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    server_tool_parts_by_text: Vec<GeminiServerToolPartsForText>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    orphan_server_tool_parts: Vec<Value>,
+}
+
+impl GeminiSignatureMetadata {
+    fn is_empty(&self) -> bool {
+        self.function_call_signatures.is_empty()
+            && self.text_part_signatures.is_empty()
+            && self.server_tool_parts_by_call_id.is_empty()
+            && self.server_tool_parts_by_text.is_empty()
+            && self.orphan_server_tool_parts.is_empty()
+    }
+
+    fn merge(&mut self, other: GeminiSignatureMetadata) {
+        self.function_call_signatures
+            .extend(other.function_call_signatures);
+        self.text_part_signatures.extend(other.text_part_signatures);
+        self.server_tool_parts_by_call_id
+            .extend(other.server_tool_parts_by_call_id);
+        self.server_tool_parts_by_text
+            .extend(other.server_tool_parts_by_text);
+        self.orphan_server_tool_parts
+            .extend(other.orphan_server_tool_parts);
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct GeminiTextPartSignature {
+    text: String,
+    thought_signature: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct GeminiServerToolPartsForText {
+    text: String,
+    parts: Vec<Value>,
 }
 
 async fn process_gemini_stream_response(
@@ -516,11 +719,25 @@ async fn process_gemini_stream_response(
     if let Some(grounding_metadata) = candidate.grounding_metadata {
         send_gemini_web_search_item(tx_event, grounding_metadata).await?;
     }
-    for part in candidate.content.parts {
-        if let Some(text) = part.text
+    let parts = candidate
+        .content
+        .map(|content| content.parts)
+        .unwrap_or_default();
+    for part in parts {
+        if let Some(server_tool_part) = part.server_tool_part_value() {
+            state.pending_server_tool_parts.push(server_tool_part);
+        }
+        if let Some(text) = part.text.as_deref()
             && !text.is_empty()
         {
-            send_gemini_streaming_output_text_delta(tx_event, state, &text).await?;
+            if part.thought == Some(true) {
+                state.reasoning_summary_text.push_str(text);
+            } else {
+                if let Some(signature) = &part.thought_signature {
+                    state.pending_text_thought_signature = Some(signature.clone());
+                }
+                send_gemini_streaming_output_text_delta(tx_event, state, text).await?;
+            }
         }
         if let Some(function_call) = part.function_call {
             flush_gemini_streaming_output_text(tx_event, state).await?;
@@ -529,8 +746,19 @@ async fn process_gemini_stream_response(
             } else {
                 function_call.id
             };
+            if !state.pending_server_tool_parts.is_empty() {
+                state
+                    .signature_metadata
+                    .server_tool_parts_by_call_id
+                    .entry(call_id.clone())
+                    .or_default()
+                    .append(&mut state.pending_server_tool_parts);
+            }
             if let Some(signature) = part.thought_signature {
-                state.signature_metadata.insert(call_id.clone(), signature);
+                state
+                    .signature_metadata
+                    .function_call_signatures
+                    .insert(call_id.clone(), signature);
             }
             let item = ResponseItem::FunctionCall {
                 id: None,
@@ -604,12 +832,31 @@ async fn flush_gemini_streaming_output_text(
     if !state.text_open {
         return Ok(());
     }
+    let text = std::mem::take(&mut state.output_text);
+    if let Some(signature) = state.pending_text_thought_signature.take()
+        && !text.is_empty()
+    {
+        state
+            .signature_metadata
+            .text_part_signatures
+            .push(GeminiTextPartSignature {
+                text: text.clone(),
+                thought_signature: signature,
+            });
+    }
+    if !state.pending_server_tool_parts.is_empty() && !text.is_empty() {
+        state
+            .signature_metadata
+            .server_tool_parts_by_text
+            .push(GeminiServerToolPartsForText {
+                text: text.clone(),
+                parts: std::mem::take(&mut state.pending_server_tool_parts),
+            });
+    }
     let item = ResponseItem::Message {
         id: Some(format!("gemini-message-{}", state.text_block_index)),
         role: "assistant".to_string(),
-        content: vec![ContentItem::OutputText {
-            text: std::mem::take(&mut state.output_text),
-        }],
+        content: vec![ContentItem::OutputText { text }],
         end_turn: None,
         phase: None,
     };
@@ -621,8 +868,17 @@ async fn flush_gemini_streaming_output_text(
         .map_err(|_| ())
 }
 
-fn gemini_signature_reasoning_item(signatures: HashMap<String, String>) -> ResponseItem {
-    let encrypted_content = serde_json::to_string(&signatures).unwrap_or_else(|_| "{}".to_string());
+fn gemini_reasoning_summary_item(text: String) -> ResponseItem {
+    ResponseItem::Reasoning {
+        id: "gemini-reasoning-summary".to_string(),
+        summary: vec![ReasoningItemReasoningSummary::SummaryText { text }],
+        content: None,
+        encrypted_content: None,
+    }
+}
+
+fn gemini_signature_reasoning_item(metadata: GeminiSignatureMetadata) -> ResponseItem {
+    let encrypted_content = serde_json::to_string(&metadata).unwrap_or_else(|_| "{}".to_string());
     ResponseItem::Reasoning {
         id: String::new(),
         summary: Vec::<ReasoningItemReasoningSummary>::new(),
@@ -634,19 +890,22 @@ fn gemini_signature_reasoning_item(signatures: HashMap<String, String>) -> Respo
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GeminiResponse {
+    #[serde(default)]
     candidates: Vec<GeminiCandidate>,
     usage_metadata: Option<GeminiUsageMetadata>,
     response_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct GeminiCandidate {
-    content: GeminiContent,
+    content: Option<GeminiContent>,
     grounding_metadata: Option<GeminiGroundingMetadata>,
 }
 
 #[derive(Debug, Deserialize)]
 struct GeminiContent {
+    #[serde(default)]
     parts: Vec<GeminiPart>,
 }
 
@@ -655,7 +914,47 @@ struct GeminiContent {
 struct GeminiPart {
     text: Option<String>,
     function_call: Option<GeminiFunctionCall>,
+    tool_call: Option<Value>,
+    tool_response: Option<Value>,
+    executable_code: Option<Value>,
+    code_execution_result: Option<Value>,
     thought_signature: Option<String>,
+    thought: Option<bool>,
+}
+
+impl GeminiPart {
+    fn server_tool_part_value(&self) -> Option<Value> {
+        if self.tool_call.is_none()
+            && self.tool_response.is_none()
+            && self.executable_code.is_none()
+            && self.code_execution_result.is_none()
+        {
+            return None;
+        }
+        let mut object = Map::new();
+        if let Some(signature) = &self.thought_signature {
+            object.insert(
+                "thoughtSignature".to_string(),
+                Value::String(signature.clone()),
+            );
+        }
+        if let Some(tool_call) = &self.tool_call {
+            object.insert("toolCall".to_string(), tool_call.clone());
+        }
+        if let Some(tool_response) = &self.tool_response {
+            object.insert("toolResponse".to_string(), tool_response.clone());
+        }
+        if let Some(executable_code) = &self.executable_code {
+            object.insert("executableCode".to_string(), executable_code.clone());
+        }
+        if let Some(code_execution_result) = &self.code_execution_result {
+            object.insert(
+                "codeExecutionResult".to_string(),
+                code_execution_result.clone(),
+            );
+        }
+        Some(Value::Object(object))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -678,6 +977,7 @@ struct GeminiGroundingMetadata {
 #[serde(rename_all = "camelCase")]
 struct GeminiUsageMetadata {
     prompt_token_count: Option<i64>,
+    cached_content_token_count: Option<i64>,
     candidates_token_count: Option<i64>,
     thoughts_token_count: Option<i64>,
     total_token_count: Option<i64>,
@@ -686,11 +986,12 @@ struct GeminiUsageMetadata {
 impl From<GeminiUsageMetadata> for TokenUsage {
     fn from(value: GeminiUsageMetadata) -> Self {
         let input_tokens = value.prompt_token_count.unwrap_or(0);
+        let cached_input_tokens = value.cached_content_token_count.unwrap_or(0);
         let output_tokens = value.candidates_token_count.unwrap_or(0);
         let reasoning_output_tokens = value.thoughts_token_count.unwrap_or(0);
         TokenUsage {
             input_tokens,
-            cached_input_tokens: 0,
+            cached_input_tokens,
             output_tokens,
             reasoning_output_tokens,
             total_tokens: value
@@ -703,6 +1004,64 @@ impl From<GeminiUsageMetadata> for TokenUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn gemini_text_part(text: &str) -> GeminiPart {
+        GeminiPart {
+            text: Some(text.to_string()),
+            function_call: None,
+            tool_call: None,
+            tool_response: None,
+            executable_code: None,
+            code_execution_result: None,
+            thought_signature: None,
+            thought: None,
+        }
+    }
+
+    fn gemini_function_call_part(
+        id: &str,
+        name: &str,
+        args: Value,
+        thought_signature: Option<&str>,
+    ) -> GeminiPart {
+        GeminiPart {
+            text: None,
+            function_call: Some(GeminiFunctionCall {
+                id: id.to_string(),
+                name: name.to_string(),
+                args,
+            }),
+            tool_call: None,
+            tool_response: None,
+            executable_code: None,
+            code_execution_result: None,
+            thought_signature: thought_signature.map(str::to_string),
+            thought: None,
+        }
+    }
+
+    fn gemini_candidate(parts: Vec<GeminiPart>) -> GeminiCandidate {
+        GeminiCandidate {
+            grounding_metadata: None,
+            content: Some(GeminiContent { parts }),
+        }
+    }
+
+    fn gemini_usage(
+        prompt_token_count: i64,
+        cached_content_token_count: i64,
+        candidates_token_count: i64,
+        thoughts_token_count: i64,
+        total_token_count: i64,
+    ) -> GeminiUsageMetadata {
+        GeminiUsageMetadata {
+            prompt_token_count: Some(prompt_token_count),
+            cached_content_token_count: Some(cached_content_token_count),
+            candidates_token_count: Some(candidates_token_count),
+            thoughts_token_count: Some(thoughts_token_count),
+            total_token_count: Some(total_token_count),
+        }
+    }
 
     #[test]
     fn gemini_namespace_tools_use_canonical_display_names() {
@@ -847,6 +1206,71 @@ mod tests {
         let body = gemini_request_body(&request);
 
         assert_eq!(body["toolConfig"]["includeServerSideToolInvocations"], true);
+        assert_eq!(
+            body["toolConfig"]["functionCallingConfig"]["mode"],
+            "VALIDATED"
+        );
+    }
+
+    #[test]
+    fn gemini_request_body_maps_reasoning_effort_to_thinking_level() {
+        let request = ResponsesApiRequest {
+            model: "gemini-3.1-pro-preview-customtools".to_string(),
+            instructions: String::new(),
+            input: Vec::new(),
+            tools: Vec::new(),
+            tool_choice: "auto".to_string(),
+            parallel_tool_calls: true,
+            reasoning: Some(Reasoning {
+                effort: Some(ReasoningEffort::Medium),
+                summary: Some(ReasoningSummary::Concise),
+            }),
+            store: false,
+            stream: true,
+            include: Vec::new(),
+            service_tier: None,
+            prompt_cache_key: None,
+            text: None,
+            client_metadata: None,
+        };
+
+        let body = gemini_request_body(&request);
+
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "medium"
+        );
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["includeThoughts"],
+            true
+        );
+    }
+
+    #[test]
+    fn gemini_request_body_omits_unsupported_minimal_thinking_level() {
+        let request = ResponsesApiRequest {
+            model: "gemini-3.1-pro-preview-customtools".to_string(),
+            instructions: String::new(),
+            input: Vec::new(),
+            tools: Vec::new(),
+            tool_choice: "auto".to_string(),
+            parallel_tool_calls: true,
+            reasoning: Some(Reasoning {
+                effort: Some(ReasoningEffort::Minimal),
+                summary: None,
+            }),
+            store: false,
+            stream: true,
+            include: Vec::new(),
+            service_tier: None,
+            prompt_cache_key: None,
+            text: None,
+            client_metadata: None,
+        };
+
+        let body = gemini_request_body(&request);
+
+        assert!(body["generationConfig"].get("thinkingConfig").is_none());
     }
 
     #[tokio::test]
@@ -860,16 +1284,7 @@ mod tests {
             GeminiResponse {
                 response_id: Some("gemini_1".to_string()),
                 usage_metadata: None,
-                candidates: vec![GeminiCandidate {
-                    grounding_metadata: None,
-                    content: GeminiContent {
-                        parts: vec![GeminiPart {
-                            text: Some("hello ".to_string()),
-                            function_call: None,
-                            thought_signature: None,
-                        }],
-                    },
-                }],
+                candidates: vec![gemini_candidate(vec![gemini_text_part("hello ")])],
             },
         )
         .await
@@ -879,22 +1294,8 @@ mod tests {
             &mut state,
             GeminiResponse {
                 response_id: None,
-                usage_metadata: Some(GeminiUsageMetadata {
-                    prompt_token_count: Some(7),
-                    candidates_token_count: Some(2),
-                    thoughts_token_count: Some(1),
-                    total_token_count: Some(10),
-                }),
-                candidates: vec![GeminiCandidate {
-                    grounding_metadata: None,
-                    content: GeminiContent {
-                        parts: vec![GeminiPart {
-                            text: Some("world".to_string()),
-                            function_call: None,
-                            thought_signature: None,
-                        }],
-                    },
-                }],
+                usage_metadata: Some(gemini_usage(7, 3, 2, 1, 10)),
+                candidates: vec![gemini_candidate(vec![gemini_text_part("world")])],
             },
         )
         .await
@@ -932,6 +1333,7 @@ mod tests {
         assert_eq!(state.response_id.as_deref(), Some("gemini_1"));
         let usage: TokenUsage = state.usage_metadata.unwrap().into();
         assert_eq!(usage.input_tokens, 7);
+        assert_eq!(usage.cached_input_tokens, 3);
         assert_eq!(usage.output_tokens, 2);
         assert_eq!(usage.reasoning_output_tokens, 1);
         assert_eq!(usage.total_tokens, 10);
@@ -948,27 +1350,15 @@ mod tests {
             GeminiResponse {
                 response_id: Some("gemini_2".to_string()),
                 usage_metadata: None,
-                candidates: vec![GeminiCandidate {
-                    grounding_metadata: None,
-                    content: GeminiContent {
-                        parts: vec![
-                            GeminiPart {
-                                text: Some("I'll run it.".to_string()),
-                                function_call: None,
-                                thought_signature: None,
-                            },
-                            GeminiPart {
-                                text: None,
-                                function_call: Some(GeminiFunctionCall {
-                                    id: "call_1".to_string(),
-                                    name: "shell".to_string(),
-                                    args: json!({"cmd": "echo ok"}),
-                                }),
-                                thought_signature: Some("sig_1".to_string()),
-                            },
-                        ],
-                    },
-                }],
+                candidates: vec![gemini_candidate(vec![
+                    gemini_text_part("I'll run it."),
+                    gemini_function_call_part(
+                        "call_1",
+                        "shell",
+                        json!({"cmd": "echo ok"}),
+                        Some("sig_1"),
+                    ),
+                ])],
             },
         )
         .await
@@ -1007,9 +1397,136 @@ mod tests {
             event => panic!("expected FunctionCall, got {event:?}"),
         }
         assert_eq!(
-            state.signature_metadata,
+            state.signature_metadata.function_call_signatures,
             HashMap::from([("call_1".to_string(), "sig_1".to_string())])
         );
+    }
+
+    #[tokio::test]
+    async fn gemini_stream_response_tolerates_metadata_only_chunks() {
+        let (tx, _rx) = mpsc::channel::<Result<ResponseEvent, ApiError>>(8);
+        let mut state = GeminiStreamState::default();
+
+        process_gemini_stream_response(
+            &tx,
+            &mut state,
+            serde_json::from_value(json!({
+                "usageMetadata": {
+                    "promptTokenCount": 11,
+                    "cachedContentTokenCount": 5,
+                    "totalTokenCount": 11
+                }
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        process_gemini_stream_response(
+            &tx,
+            &mut state,
+            serde_json::from_value(json!({
+                "candidates": [{"finishReason": "SAFETY"}]
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let usage: TokenUsage = state.usage_metadata.unwrap().into();
+        assert_eq!(usage.input_tokens, 11);
+        assert_eq!(usage.cached_input_tokens, 5);
+    }
+
+    #[tokio::test]
+    async fn gemini_stream_response_collects_thought_summary_parts() {
+        let (tx, _rx) = mpsc::channel::<Result<ResponseEvent, ApiError>>(8);
+        let mut state = GeminiStreamState::default();
+
+        process_gemini_stream_response(
+            &tx,
+            &mut state,
+            GeminiResponse {
+                response_id: Some("gemini_reasoning".to_string()),
+                usage_metadata: None,
+                candidates: vec![gemini_candidate(vec![GeminiPart {
+                    text: Some("Checking the recent docs.".to_string()),
+                    function_call: None,
+                    tool_call: None,
+                    tool_response: None,
+                    executable_code: None,
+                    code_execution_result: None,
+                    thought_signature: None,
+                    thought: Some(true),
+                }])],
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(state.reasoning_summary_text, "Checking the recent docs.");
+    }
+
+    #[tokio::test]
+    async fn gemini_preserves_server_tool_parts_before_function_call() {
+        let (tx, mut rx) = mpsc::channel::<Result<ResponseEvent, ApiError>>(8);
+        let mut state = GeminiStreamState::default();
+
+        process_gemini_stream_response(
+            &tx,
+            &mut state,
+            GeminiResponse {
+                response_id: Some("gemini_tools".to_string()),
+                usage_metadata: None,
+                candidates: vec![gemini_candidate(vec![
+                    GeminiPart {
+                        text: None,
+                        function_call: None,
+                        tool_call: Some(json!({
+                            "toolType": "GOOGLE_SEARCH_WEB",
+                            "args": {"queries": ["current codex cli release"]},
+                            "id": "search_1"
+                        })),
+                        tool_response: None,
+                        executable_code: None,
+                        code_execution_result: None,
+                        thought_signature: Some("tool_sig_1".to_string()),
+                        thought: None,
+                    },
+                    gemini_function_call_part(
+                        "call_1",
+                        "shell",
+                        json!({"cmd": "pwd"}),
+                        Some("call_sig_1"),
+                    ),
+                ])],
+            },
+        )
+        .await
+        .unwrap();
+
+        match rx.recv().await.unwrap().unwrap() {
+            ResponseEvent::OutputItemDone(ResponseItem::FunctionCall { call_id, .. }) => {
+                assert_eq!(call_id, "call_1");
+            }
+            event => panic!("expected FunctionCall, got {event:?}"),
+        }
+
+        let contents = gemini_contents(&[
+            gemini_signature_reasoning_item(std::mem::take(&mut state.signature_metadata)),
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "shell".to_string(),
+                namespace: None,
+                arguments: r#"{"cmd":"pwd"}"#.to_string(),
+                call_id: "call_1".to_string(),
+            },
+        ]);
+
+        assert_eq!(contents.len(), 1);
+        assert_eq!(contents[0]["parts"][0]["toolCall"]["id"], "search_1");
+        assert_eq!(contents[0]["parts"][0]["thoughtSignature"], "tool_sig_1");
+        assert_eq!(contents[0]["parts"][1]["functionCall"]["id"], "call_1");
+        assert_eq!(contents[0]["parts"][1]["thoughtSignature"], "call_sig_1");
     }
 
     #[tokio::test]
@@ -1020,19 +1537,19 @@ mod tests {
         process_gemini_stream_response(
             &tx,
             &mut state,
-            GeminiResponse {
-                response_id: Some("gemini_3".to_string()),
-                usage_metadata: None,
-                candidates: vec![GeminiCandidate {
-                    grounding_metadata: Some(GeminiGroundingMetadata {
-                        web_search_queries: vec![
+            serde_json::from_value(json!({
+                "responseId": "gemini_3",
+                "candidates": [{
+                    "content": {"parts": []},
+                    "groundingMetadata": {
+                        "webSearchQueries": [
                             "latest codex cli release".to_string(),
                             "openai codex cli 0.124".to_string(),
-                        ],
-                    }),
-                    content: GeminiContent { parts: Vec::new() },
-                }],
-            },
+                        ]
+                    }
+                }]
+            }))
+            .unwrap(),
         )
         .await
         .unwrap();
