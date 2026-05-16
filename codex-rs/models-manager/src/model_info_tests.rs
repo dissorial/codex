@@ -24,7 +24,20 @@ fn gemini_31_pro_customtools_has_explicit_model_metadata() {
     assert_eq!(model.display_name, "Gemini 3.1 Pro Preview Custom Tools");
     assert_eq!(model.context_window, Some(1_048_576));
     assert_eq!(model.max_context_window, Some(1_048_576));
+    assert_eq!(
+        model
+            .supported_reasoning_levels
+            .iter()
+            .map(|preset| preset.effort)
+            .collect::<Vec<_>>(),
+        vec![
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High
+        ]
+    );
     assert!(model.supports_parallel_tool_calls);
+    assert!(model.supports_search_tool);
     assert!(!model.used_fallback_model_metadata);
     assert!(model.model_messages.is_none());
 }
