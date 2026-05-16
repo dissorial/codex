@@ -97,23 +97,16 @@ fn anthropic_effort(request: &ResponsesApiRequest) -> Option<&'static str> {
 }
 
 fn anthropic_messages(items: &[ResponseItem]) -> Vec<Value> {
-    let mut messages = Vec::new();
-    let mut pending_tool_uses = Vec::new();
-    let mut pending_tool_results = Vec::new();
+    let mut builder = AnthropicMessagesBuilder::default();
     for item in items {
         match item {
             ResponseItem::Message { role, content, .. } => {
-                flush_pending_tool_exchange(
-                    &mut messages,
-                    &mut pending_tool_uses,
-                    &mut pending_tool_results,
-                );
                 let role = if role == "assistant" {
                     "assistant"
                 } else {
                     "user"
                 };
-                push_message(&mut messages, role, anthropic_content(content));
+                builder.push_message(role, anthropic_content(content));
             }
             ResponseItem::FunctionCall {
                 call_id,
@@ -123,11 +116,13 @@ fn anthropic_messages(items: &[ResponseItem]) -> Vec<Value> {
             } => {
                 let input =
                     serde_json::from_str(arguments).unwrap_or(Value::String(arguments.clone()));
-                pending_tool_uses
-                    .push(json!({"type": "tool_use", "id": call_id, "name": name, "input": input}));
+                builder.push_tool_use(
+                    call_id,
+                    json!({"type": "tool_use", "id": call_id, "name": name, "input": input}),
+                );
             }
             ResponseItem::FunctionCallOutput { call_id, output } => {
-                pending_tool_results.push(tool_result_block(call_id, output));
+                builder.push_tool_result(call_id, tool_result_block(call_id, output));
             }
             ResponseItem::CustomToolCall {
                 call_id,
@@ -136,39 +131,114 @@ fn anthropic_messages(items: &[ResponseItem]) -> Vec<Value> {
                 ..
             } => {
                 let input = serde_json::from_str(input).unwrap_or(Value::String(input.clone()));
-                pending_tool_uses
-                    .push(json!({"type": "tool_use", "id": call_id, "name": name, "input": input}));
+                builder.push_tool_use(
+                    call_id,
+                    json!({"type": "tool_use", "id": call_id, "name": name, "input": input}),
+                );
             }
             ResponseItem::CustomToolCallOutput {
                 call_id, output, ..
             } => {
-                pending_tool_results.push(tool_result_block(call_id, output));
+                builder.push_tool_result(call_id, tool_result_block(call_id, output));
             }
             _ => {}
         }
     }
-    flush_pending_tool_exchange(
-        &mut messages,
-        &mut pending_tool_uses,
-        &mut pending_tool_results,
-    );
-    messages
+    builder.finish()
 }
 
-fn flush_pending_tool_exchange(
-    messages: &mut Vec<Value>,
-    pending_tool_uses: &mut Vec<Value>,
-    pending_tool_results: &mut Vec<Value>,
-) {
-    if pending_tool_uses.is_empty() && pending_tool_results.is_empty() {
-        return;
+#[derive(Default)]
+struct AnthropicMessagesBuilder {
+    messages: Vec<Value>,
+    pending_tool_uses: Vec<PendingToolUse>,
+    pending_tool_results: HashMap<String, Value>,
+    deferred_messages: Vec<DeferredMessage>,
+}
+
+struct PendingToolUse {
+    id: String,
+    block: Value,
+}
+
+struct DeferredMessage {
+    role: &'static str,
+    content: Vec<Value>,
+}
+
+impl AnthropicMessagesBuilder {
+    fn push_message(&mut self, role: &'static str, content: Vec<Value>) {
+        if self.pending_tool_uses.is_empty() {
+            push_message(&mut self.messages, role, content);
+        } else {
+            self.deferred_messages
+                .push(DeferredMessage { role, content });
+        }
     }
 
-    if !pending_tool_uses.is_empty() {
-        push_message(messages, "assistant", std::mem::take(pending_tool_uses));
+    fn push_tool_use(&mut self, call_id: &str, block: Value) {
+        self.pending_tool_uses.push(PendingToolUse {
+            id: call_id.to_string(),
+            block,
+        });
     }
-    if !pending_tool_results.is_empty() {
-        push_message(messages, "user", std::mem::take(pending_tool_results));
+
+    fn push_tool_result(&mut self, call_id: &str, block: Value) {
+        if self
+            .pending_tool_uses
+            .iter()
+            .any(|tool_use| tool_use.id == call_id)
+        {
+            self.pending_tool_results.insert(call_id.to_string(), block);
+            if self
+                .pending_tool_uses
+                .iter()
+                .all(|tool_use| self.pending_tool_results.contains_key(tool_use.id.as_str()))
+            {
+                self.flush_tool_exchange();
+            }
+        }
+    }
+
+    fn finish(mut self) -> Vec<Value> {
+        if !self.pending_tool_uses.is_empty() {
+            let missing_tool_results = self
+                .pending_tool_uses
+                .iter()
+                .filter(|tool_use| !self.pending_tool_results.contains_key(tool_use.id.as_str()))
+                .map(|tool_use| tool_use.id.clone())
+                .collect::<Vec<_>>();
+            for tool_use_id in missing_tool_results {
+                self.pending_tool_results.insert(
+                    tool_use_id.clone(),
+                    interrupted_tool_result_block(&tool_use_id),
+                );
+            }
+            self.flush_tool_exchange();
+        }
+        self.messages
+    }
+
+    fn flush_tool_exchange(&mut self) {
+        if self.pending_tool_uses.is_empty() {
+            return;
+        }
+        let pending_tool_uses = std::mem::take(&mut self.pending_tool_uses);
+        let mut tool_use_blocks = Vec::new();
+        let mut tool_result_blocks = Vec::new();
+        for tool_use in pending_tool_uses {
+            tool_result_blocks.push(
+                self.pending_tool_results
+                    .remove(tool_use.id.as_str())
+                    .unwrap_or_else(|| interrupted_tool_result_block(&tool_use.id)),
+            );
+            tool_use_blocks.push(tool_use.block);
+        }
+        push_message(&mut self.messages, "assistant", tool_use_blocks);
+        push_message(&mut self.messages, "user", tool_result_blocks);
+
+        for DeferredMessage { role, content } in std::mem::take(&mut self.deferred_messages) {
+            push_message(&mut self.messages, role, content);
+        }
     }
 }
 
@@ -222,6 +292,15 @@ fn tool_result_block(call_id: &str, output: &FunctionCallOutputPayload) -> Value
         "tool_use_id": call_id,
         "content": function_output_text(&output.body),
         "is_error": output.success == Some(false),
+    })
+}
+
+fn interrupted_tool_result_block(call_id: &str) -> Value {
+    json!({
+        "type": "tool_result",
+        "tool_use_id": call_id,
+        "content": "Tool execution was interrupted before a result was recorded.",
+        "is_error": true,
     })
 }
 
@@ -886,6 +965,125 @@ mod tests {
         assert_eq!(messages[2]["role"], "user");
         assert_eq!(messages[2]["content"][0]["type"], "tool_result");
         assert_eq!(messages[2]["content"][0]["tool_use_id"], "toolu_test");
+    }
+
+    #[test]
+    fn anthropic_messages_defers_regular_messages_until_after_tool_result() {
+        let messages = anthropic_messages(&[
+            ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "make a file".to_string(),
+                }],
+                end_turn: None,
+                phase: None,
+            },
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "shell".to_string(),
+                namespace: None,
+                arguments: r#"{"cmd":"mkdir -p smoke-project"}"#.to_string(),
+                call_id: "toolu_deferred".to_string(),
+            },
+            ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "background context that arrived before the output".to_string(),
+                }],
+                end_turn: None,
+                phase: None,
+            },
+            ResponseItem::FunctionCallOutput {
+                call_id: "toolu_deferred".to_string(),
+                output: FunctionCallOutputPayload::from_text("ok".to_string()),
+            },
+        ]);
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"][0]["type"], "tool_use");
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(messages[2]["content"][0]["type"], "tool_result");
+        assert_eq!(messages[2]["content"][0]["tool_use_id"], "toolu_deferred");
+        assert_eq!(messages[2]["content"][1]["type"], "text");
+    }
+
+    #[test]
+    fn anthropic_messages_synthesizes_result_for_dangling_tool_use() {
+        let messages = anthropic_messages(&[
+            ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "run something".to_string(),
+                }],
+                end_turn: None,
+                phase: None,
+            },
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "shell".to_string(),
+                namespace: None,
+                arguments: r#"{"cmd":"sleep 10"}"#.to_string(),
+                call_id: "toolu_interrupted".to_string(),
+            },
+        ]);
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"][0]["type"], "tool_use");
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(messages[2]["content"][0]["type"], "tool_result");
+        assert_eq!(
+            messages[2]["content"][0]["tool_use_id"],
+            "toolu_interrupted"
+        );
+        assert_eq!(messages[2]["content"][0]["is_error"], true);
+    }
+
+    #[test]
+    fn anthropic_messages_orders_parallel_tool_results_by_tool_use() {
+        let messages = anthropic_messages(&[
+            ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "run two things".to_string(),
+                }],
+                end_turn: None,
+                phase: None,
+            },
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "shell".to_string(),
+                namespace: None,
+                arguments: r#"{"cmd":"echo one"}"#.to_string(),
+                call_id: "toolu_one".to_string(),
+            },
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "shell".to_string(),
+                namespace: None,
+                arguments: r#"{"cmd":"echo two"}"#.to_string(),
+                call_id: "toolu_two".to_string(),
+            },
+            ResponseItem::FunctionCallOutput {
+                call_id: "toolu_two".to_string(),
+                output: FunctionCallOutputPayload::from_text("two".to_string()),
+            },
+            ResponseItem::FunctionCallOutput {
+                call_id: "toolu_one".to_string(),
+                output: FunctionCallOutputPayload::from_text("one".to_string()),
+            },
+        ]);
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1]["content"][0]["id"], "toolu_one");
+        assert_eq!(messages[1]["content"][1]["id"], "toolu_two");
+        assert_eq!(messages[2]["content"][0]["tool_use_id"], "toolu_one");
+        assert_eq!(messages[2]["content"][1]["tool_use_id"], "toolu_two");
     }
 
     #[test]
