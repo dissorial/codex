@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -319,11 +320,35 @@ impl CoreToolRuntime for ExposureOverride {
 
 pub struct ToolRegistry {
     tools: HashMap<ToolName, Arc<dyn CoreToolRuntime>>,
+    flat_name_aliases: HashMap<String, ToolName>,
 }
 
 impl ToolRegistry {
     fn new(tools: HashMap<ToolName, Arc<dyn CoreToolRuntime>>) -> Self {
-        Self { tools }
+        let mut flat_name_aliases = HashMap::new();
+        let mut ambiguous_flat_names = HashSet::new();
+        for name in tools.keys() {
+            if name.namespace.is_none() {
+                continue;
+            }
+
+            let flat_name = flat_tool_name(name).into_owned();
+            if ambiguous_flat_names.contains(&flat_name) {
+                continue;
+            }
+            if flat_name_aliases
+                .insert(flat_name.clone(), name.clone())
+                .is_some()
+            {
+                flat_name_aliases.remove(&flat_name);
+                ambiguous_flat_names.insert(flat_name);
+            }
+        }
+
+        Self {
+            tools,
+            flat_name_aliases,
+        }
     }
 
     pub(crate) fn from_tools(tools: impl IntoIterator<Item = Arc<dyn CoreToolRuntime>>) -> Self {
@@ -353,8 +378,21 @@ impl ToolRegistry {
         Self::new(HashMap::from([(name, handler as Arc<dyn CoreToolRuntime>)]))
     }
 
+    fn resolve_tool_name(&self, name: &ToolName) -> Option<ToolName> {
+        if self.tools.contains_key(name) {
+            return Some(name.clone());
+        }
+
+        if name.namespace.is_none() {
+            return self.flat_name_aliases.get(&name.name).cloned();
+        }
+
+        None
+    }
+
     fn tool(&self, name: &ToolName) -> Option<Arc<dyn CoreToolRuntime>> {
-        self.tools.get(name).map(Arc::clone)
+        let resolved_name = self.resolve_tool_name(name)?;
+        self.tools.get(&resolved_name).map(Arc::clone)
     }
 
     #[cfg(test)]
@@ -366,7 +404,7 @@ impl ToolRegistry {
 
     #[cfg(test)]
     pub(crate) fn tool_exposure(&self, name: &ToolName) -> Option<ToolExposure> {
-        self.tools.get(name).map(|tool| tool.exposure())
+        self.tool(name).map(|tool| tool.exposure())
     }
 
     pub(crate) fn create_diff_consumer(
@@ -399,8 +437,7 @@ impl ToolRegistry {
         mut invocation: ToolInvocation,
         terminal_outcome_reached: Option<Arc<AtomicBool>>,
     ) -> Result<AnyToolResult, FunctionCallError> {
-        let tool_name = invocation.tool_name.clone();
-        let tool_name_flat = flat_tool_name(&tool_name);
+        let requested_tool_name = invocation.tool_name.clone();
         let call_id_owned = invocation.call_id.clone();
         let otel = invocation.turn.session_telemetry.clone();
         let base_tool_result_tags = [
@@ -430,27 +467,33 @@ impl ToolRegistry {
             }
         }
 
-        let dispatch_trace = ToolDispatchTrace::start(&invocation);
-        let tool = match self.tool(&tool_name) {
-            Some(tool) => tool,
-            None => {
-                let message = unsupported_tool_call_message(&invocation.payload, &tool_name);
-                let log_payload = invocation.payload.log_payload();
-                otel.tool_result_with_tags(
-                    tool_name_flat.as_ref(),
-                    &call_id_owned,
-                    log_payload.as_ref(),
-                    Duration::ZERO,
-                    /*success*/ false,
-                    &message,
-                    &base_tool_result_tags,
-                    /*extra_trace_fields*/ &[],
-                );
-                let err = FunctionCallError::RespondToModel(message);
-                dispatch_trace.record_failed(&err);
-                return Err(err);
-            }
+        let Some(tool_name) = self.resolve_tool_name(&requested_tool_name) else {
+            let tool_name_flat = flat_tool_name(&requested_tool_name);
+            let message = unsupported_tool_call_message(&invocation.payload, &requested_tool_name);
+            let log_payload = invocation.payload.log_payload();
+            otel.tool_result_with_tags(
+                tool_name_flat.as_ref(),
+                &call_id_owned,
+                log_payload.as_ref(),
+                Duration::ZERO,
+                /*success*/ false,
+                &message,
+                &base_tool_result_tags,
+                /*extra_trace_fields*/ &[],
+            );
+            let err = FunctionCallError::RespondToModel(message);
+            ToolDispatchTrace::start(&invocation).record_failed(&err);
+            return Err(err);
         };
+        invocation.tool_name = tool_name.clone();
+        let tool_name_flat = flat_tool_name(&tool_name);
+
+        let dispatch_trace = ToolDispatchTrace::start(&invocation);
+        let tool = self
+            .tools
+            .get(&tool_name)
+            .map(Arc::clone)
+            .expect("resolved tool name should have a registered handler");
 
         let telemetry_tags = tool.telemetry_tags(&invocation).await;
         let mut tool_result_tags =

@@ -27,6 +27,37 @@ impl ToolExecutor<ToolInvocation> for TestHandler {
 
 impl CoreToolRuntime for TestHandler {}
 
+struct CapturingHandler {
+    tool_name: codex_tools::ToolName,
+    invocations: Arc<std::sync::Mutex<Vec<codex_tools::ToolName>>>,
+}
+
+#[async_trait::async_trait]
+impl ToolExecutor<ToolInvocation> for CapturingHandler {
+    fn tool_name(&self) -> codex_tools::ToolName {
+        self.tool_name.clone()
+    }
+
+    fn spec(&self) -> codex_tools::ToolSpec {
+        test_spec(&self.tool_name)
+    }
+
+    async fn handle(
+        &self,
+        invocation: ToolInvocation,
+    ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
+        self.invocations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(invocation.tool_name);
+        Ok(Box::new(
+            crate::tools::context::FunctionToolOutput::from_text("ok".to_string(), Some(true)),
+        ))
+    }
+}
+
+impl CoreToolRuntime for CapturingHandler {}
+
 #[derive(Clone)]
 enum LifecycleTestResult {
     Ok { success: bool },
@@ -170,6 +201,88 @@ fn handler_looks_up_namespaced_aliases_explicitly() {
             .as_ref()
             .is_some_and(|handler| Arc::ptr_eq(handler, &namespaced_handler))
     );
+}
+
+#[test]
+fn handler_resolves_provider_flattened_namespaced_tool_calls() {
+    let namespaced_name =
+        codex_tools::ToolName::namespaced("mcp__delegento__", "list_available_integrations");
+    let flattened_name =
+        codex_tools::ToolName::plain("mcp__delegento__list_available_integrations");
+    let namespaced_handler = Arc::new(TestHandler {
+        tool_name: namespaced_name.clone(),
+    }) as Arc<dyn CoreToolRuntime>;
+    let registry = ToolRegistry::new(HashMap::from([(
+        namespaced_name.clone(),
+        Arc::clone(&namespaced_handler),
+    )]));
+
+    let resolved = registry.tool(&flattened_name);
+
+    assert!(
+        resolved
+            .as_ref()
+            .is_some_and(|handler| Arc::ptr_eq(handler, &namespaced_handler))
+    );
+}
+
+#[test]
+fn exact_plain_tool_names_win_over_flattened_aliases() {
+    let flattened_name =
+        codex_tools::ToolName::plain("mcp__delegento__list_available_integrations");
+    let namespaced_name =
+        codex_tools::ToolName::namespaced("mcp__delegento__", "list_available_integrations");
+    let plain_handler = Arc::new(TestHandler {
+        tool_name: flattened_name.clone(),
+    }) as Arc<dyn CoreToolRuntime>;
+    let namespaced_handler = Arc::new(TestHandler {
+        tool_name: namespaced_name.clone(),
+    }) as Arc<dyn CoreToolRuntime>;
+    let registry = ToolRegistry::new(HashMap::from([
+        (flattened_name.clone(), Arc::clone(&plain_handler)),
+        (namespaced_name, namespaced_handler),
+    ]));
+
+    let resolved = registry.tool(&flattened_name);
+
+    assert!(
+        resolved
+            .as_ref()
+            .is_some_and(|handler| Arc::ptr_eq(handler, &plain_handler))
+    );
+}
+
+#[tokio::test]
+async fn dispatch_uses_canonical_tool_name_for_provider_flattened_calls() -> anyhow::Result<()> {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let canonical_name =
+        codex_tools::ToolName::namespaced("mcp__delegento__", "list_available_integrations");
+    let provider_name = codex_tools::ToolName::plain("mcp__delegento__list_available_integrations");
+    let invocations = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let handler = Arc::new(CapturingHandler {
+        tool_name: canonical_name.clone(),
+        invocations: Arc::clone(&invocations),
+    }) as Arc<dyn CoreToolRuntime>;
+    let registry = ToolRegistry::from_tools([handler]);
+
+    registry
+        .dispatch_any(test_invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "call-provider-flat",
+            provider_name,
+        ))
+        .await?;
+
+    assert_eq!(
+        invocations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_slice(),
+        [canonical_name]
+    );
+
+    Ok(())
 }
 
 #[tokio::test]
