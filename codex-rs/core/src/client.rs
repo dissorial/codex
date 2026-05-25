@@ -382,9 +382,11 @@ impl ModelClient {
             .is_some_and(|manager| manager.codex_api_key_env_enabled());
         let auth_env_telemetry =
             collect_auth_env_telemetry(model_provider.info(), codex_api_key_env_enabled);
+        let include_attestation = model_provider.supports_attestation();
         let client = ModelClient {
             state: Arc::new(ModelClientState {
-                conversation_id: self.state.conversation_id,
+                session_id: self.state.session_id,
+                thread_id: self.state.thread_id,
                 window_generation: AtomicU64::new(
                     self.state.window_generation.load(Ordering::Relaxed),
                 ),
@@ -396,6 +398,8 @@ impl ModelClient {
                 enable_request_compression: self.state.enable_request_compression,
                 include_timing_metrics: self.state.include_timing_metrics,
                 beta_features_header: self.state.beta_features_header.clone(),
+                include_attestation,
+                attestation_provider: self.state.attestation_provider.clone(),
                 disable_websockets: AtomicBool::new(
                     self.state.disable_websockets.load(Ordering::Relaxed),
                 ),

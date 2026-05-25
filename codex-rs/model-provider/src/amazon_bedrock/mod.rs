@@ -43,6 +43,9 @@ impl AmazonBedrockModelProvider {
             .unwrap_or(ModelProviderAwsAuthInfo {
                 profile: None,
                 region: None,
+                access_key_id: None,
+                secret_access_key: None,
+                session_token: None,
             });
         Self {
             info: provider_info,

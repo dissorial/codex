@@ -864,7 +864,11 @@ async fn refresh_available_models_fetches_with_chatgpt_auth_tokens() {
 
 #[test]
 fn build_available_models_picks_default_after_hiding_hidden_models() {
-    let manager = static_manager_for_tests(ModelsResponse { models: Vec::new() });
+    let codex_home = tempdir().expect("temp dir");
+    let manager = openai_manager_for_tests(
+        codex_home.path().to_path_buf(),
+        TestModelsEndpoint::without_refresh(Vec::new()),
+    );
 
     let hidden_model =
         remote_model_with_visibility("hidden", "Hidden", /*priority*/ 0, "hide");
@@ -882,6 +886,11 @@ fn build_available_models_picks_default_after_hiding_hidden_models() {
         available
             .iter()
             .any(|preset| preset.model == "gemini-3.1-pro-preview-customtools")
+    );
+    assert!(
+        available
+            .iter()
+            .any(|preset| preset.model == "gemini-3.5-flash")
     );
 }
 

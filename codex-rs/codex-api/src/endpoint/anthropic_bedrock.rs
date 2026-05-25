@@ -6,9 +6,11 @@ use crate::error::ApiError;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use codex_client::HttpTransport;
+use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputPayload;
+use codex_protocol::models::ReasoningItemReasoningSummary;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::models::WebSearchAction;
 use codex_protocol::openai_models::ReasoningEffort;
@@ -18,6 +20,7 @@ use http::HeaderMap;
 use http::HeaderValue;
 use http::Method;
 use serde::Deserialize;
+use serde::Serialize;
 use serde_json::Value;
 use serde_json::json;
 use std::collections::HashMap;
@@ -25,6 +28,7 @@ use tokio::sync::mpsc;
 
 const ANTHROPIC_VERSION: &str = "bedrock-2023-05-31";
 const MAX_OUTPUT_TOKENS: u32 = 128_000;
+const ANTHROPIC_THINKING_METADATA_PREFIX: &str = "anthropic-bedrock-thinking:";
 
 pub(crate) async fn stream_request<T: HttpTransport>(
     session: &EndpointSession<T>,
@@ -46,7 +50,10 @@ pub(crate) async fn stream_request<T: HttpTransport>(
         .stream_with(Method::POST, &path, headers, Some(body), |_| {})
         .await?;
 
-    Ok(response_stream_from_eventstream(response.bytes))
+    Ok(response_stream_from_eventstream(
+        response.bytes,
+        request.model,
+    ))
 }
 
 fn anthropic_request_body(request: &ResponsesApiRequest) -> Value {
@@ -82,9 +89,16 @@ fn anthropic_system(instructions: &str) -> Option<Value> {
 
 fn anthropic_thinking(request: &ResponsesApiRequest) -> Option<Value> {
     anthropic_effort(request)?;
-    Some(json!({
-        "type": "adaptive",
-    }))
+    let mut thinking = json!({ "type": "adaptive" });
+    if request
+        .reasoning
+        .as_ref()
+        .and_then(|reasoning| reasoning.summary)
+        .is_some_and(|summary| summary != ReasoningSummary::None)
+    {
+        thinking["display"] = json!("summarized");
+    }
+    Some(thinking)
 }
 
 fn anthropic_effort(request: &ResponsesApiRequest) -> Option<&'static str> {
@@ -93,6 +107,25 @@ fn anthropic_effort(request: &ResponsesApiRequest) -> Option<&'static str> {
         ReasoningEffort::Medium => Some("medium"),
         ReasoningEffort::High => Some("high"),
         ReasoningEffort::None | ReasoningEffort::Minimal | ReasoningEffort::XHigh => None,
+    }
+}
+
+fn anthropic_model_matches_requested(requested_model: &str, response_model: &str) -> bool {
+    match (
+        claude_model_family(requested_model),
+        claude_model_family(response_model),
+    ) {
+        (Some(requested), Some(response)) => requested == response,
+        (Some(_), None) => false,
+        _ => true,
+    }
+}
+
+fn claude_model_family(model: &str) -> Option<&'static str> {
+    if model.contains("claude-opus-4-6") {
+        Some("claude-opus-4-6")
+    } else {
+        None
     }
 }
 
@@ -141,10 +174,21 @@ fn anthropic_messages(items: &[ResponseItem]) -> Vec<Value> {
             } => {
                 builder.push_tool_result(call_id, tool_result_block(call_id, output));
             }
+            ResponseItem::Reasoning {
+                encrypted_content, ..
+            } => {
+                if let Some(blocks) = anthropic_reasoning_blocks(encrypted_content.as_deref()) {
+                    for block in blocks {
+                        builder.push_assistant_content(block);
+                    }
+                }
+            }
             _ => {}
         }
     }
-    builder.finish()
+    let mut messages = builder.finish();
+    mark_last_message_for_prompt_cache(&mut messages);
+    messages
 }
 
 #[derive(Default)]
@@ -166,6 +210,10 @@ struct DeferredMessage {
 }
 
 impl AnthropicMessagesBuilder {
+    fn push_assistant_content(&mut self, block: Value) {
+        self.push_message("assistant", vec![block]);
+    }
+
     fn push_message(&mut self, role: &'static str, content: Vec<Value>) {
         if self.pending_tool_uses.is_empty() {
             push_message(&mut self.messages, role, content);
@@ -242,6 +290,44 @@ impl AnthropicMessagesBuilder {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct AnthropicThinkingMetadata {
+    blocks: Vec<AnthropicThinkingMetadataBlock>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum AnthropicThinkingMetadataBlock {
+    Thinking { thinking: String, signature: String },
+    RedactedThinking { data: String },
+}
+
+fn anthropic_reasoning_blocks(encrypted_content: Option<&str>) -> Option<Vec<Value>> {
+    let metadata = encrypted_content?
+        .strip_prefix(ANTHROPIC_THINKING_METADATA_PREFIX)
+        .and_then(|metadata| serde_json::from_str::<AnthropicThinkingMetadata>(metadata).ok())?;
+    Some(
+        metadata
+            .blocks
+            .into_iter()
+            .map(|block| match block {
+                AnthropicThinkingMetadataBlock::Thinking {
+                    thinking,
+                    signature,
+                } => json!({
+                    "type": "thinking",
+                    "thinking": thinking,
+                    "signature": signature,
+                }),
+                AnthropicThinkingMetadataBlock::RedactedThinking { data } => json!({
+                    "type": "redacted_thinking",
+                    "data": data,
+                }),
+            })
+            .collect(),
+    )
+}
+
 fn push_message(messages: &mut Vec<Value>, role: &str, content: Vec<Value>) {
     if content.is_empty() {
         return;
@@ -254,6 +340,20 @@ fn push_message(messages: &mut Vec<Value>, role: &str, content: Vec<Value>) {
         return;
     }
     messages.push(json!({"role": role, "content": content}));
+}
+
+fn mark_last_message_for_prompt_cache(messages: &mut [Value]) {
+    let Some(content) = messages
+        .last_mut()
+        .and_then(|message| message.get_mut("content"))
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    let Some(last_block) = content.last_mut().and_then(Value::as_object_mut) else {
+        return;
+    };
+    last_block.insert("cache_control".to_string(), json!({"type": "ephemeral"}));
 }
 
 fn anthropic_content(content: &[ContentItem]) -> Vec<Value> {
@@ -367,13 +467,19 @@ fn anthropic_function_tool(tool: &Value) -> Option<Value> {
     }))
 }
 
-fn response_stream_from_eventstream(mut bytes: codex_client::ByteStream) -> ResponseStream {
+fn response_stream_from_eventstream(
+    mut bytes: codex_client::ByteStream,
+    requested_model: String,
+) -> ResponseStream {
     let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent, ApiError>>(1600);
     tokio::spawn(async move {
         let _ = tx_event.send(Ok(ResponseEvent::Created)).await;
 
         let mut buffer = Vec::new();
-        let mut state = AnthropicStreamState::default();
+        let mut state = AnthropicStreamState {
+            requested_model: Some(requested_model),
+            ..Default::default()
+        };
         while let Some(chunk) = bytes.next().await {
             let chunk = match chunk {
                 Ok(chunk) => chunk,
@@ -427,17 +533,22 @@ fn response_stream_from_eventstream(mut bytes: codex_client::ByteStream) -> Resp
                 .await;
         }
     });
-    ResponseStream { rx_event }
+    ResponseStream {
+        rx_event,
+        upstream_request_id: None,
+    }
 }
 
 #[derive(Default)]
 struct AnthropicStreamState {
+    requested_model: Option<String>,
     response_id: Option<String>,
     usage: Option<TokenUsage>,
     text_open: bool,
     text_block_index: u32,
     output_text: String,
     tool_blocks: HashMap<i64, AnthropicToolBlock>,
+    thinking_blocks: HashMap<i64, AnthropicThinkingBlock>,
     completed: bool,
 }
 
@@ -453,6 +564,15 @@ enum AnthropicToolBlockKind {
     WebSearch,
 }
 
+struct AnthropicThinkingBlock {
+    kind: AnthropicThinkingBlockKind,
+}
+
+enum AnthropicThinkingBlockKind {
+    Thinking { thinking: String, signature: String },
+    RedactedThinking { data: String },
+}
+
 async fn process_anthropic_stream_event(
     tx_event: &mpsc::Sender<Result<ResponseEvent, ApiError>>,
     state: &mut AnthropicStreamState,
@@ -465,6 +585,19 @@ async fn process_anthropic_stream_event(
                     .get("id")
                     .and_then(Value::as_str)
                     .map(ToString::to_string);
+                if let Some(response_model) = message.get("model").and_then(Value::as_str)
+                    && let Some(requested_model) = state.requested_model.as_deref()
+                    && !anthropic_model_matches_requested(requested_model, response_model)
+                {
+                    tx_event
+                        .send(Err(ApiError::Stream(format!(
+                            "Bedrock Claude returned model `{response_model}` for requested model `{requested_model}`"
+                        ))))
+                        .await
+                        .map_err(|_| ())?;
+                    state.completed = true;
+                    return Err(());
+                }
                 state.usage = message
                     .get("usage")
                     .and_then(|usage| serde_json::from_value::<AnthropicUsage>(usage.clone()).ok())
@@ -477,7 +610,40 @@ async fn process_anthropic_stream_event(
                 return Ok(());
             };
             let block_type = block.get("type").and_then(Value::as_str);
-            if block_type == Some("tool_use") || block_type == Some("server_tool_use") {
+            if block_type == Some("thinking") {
+                flush_streaming_output_text(tx_event, state).await?;
+                state.thinking_blocks.insert(
+                    index,
+                    AnthropicThinkingBlock {
+                        kind: AnthropicThinkingBlockKind::Thinking {
+                            thinking: block
+                                .get("thinking")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string(),
+                            signature: block
+                                .get("signature")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string(),
+                        },
+                    },
+                );
+            } else if block_type == Some("redacted_thinking") {
+                flush_streaming_output_text(tx_event, state).await?;
+                state.thinking_blocks.insert(
+                    index,
+                    AnthropicThinkingBlock {
+                        kind: AnthropicThinkingBlockKind::RedactedThinking {
+                            data: block
+                                .get("data")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string(),
+                        },
+                    },
+                );
+            } else if block_type == Some("tool_use") || block_type == Some("server_tool_use") {
                 flush_streaming_output_text(tx_event, state).await?;
                 let name = block
                     .get("name")
@@ -526,13 +692,39 @@ async fn process_anthropic_stream_event(
                         block.input_json.push_str(partial);
                     }
                 }
-                Some("thinking_delta") | Some("signature_delta") => {}
+                Some("thinking_delta") => {
+                    let index = event.get("index").and_then(Value::as_i64).unwrap_or(0);
+                    if let Some(thinking) = delta.get("thinking").and_then(Value::as_str)
+                        && let Some(block) = state.thinking_blocks.get_mut(&index)
+                        && let AnthropicThinkingBlockKind::Thinking { thinking: text, .. } =
+                            &mut block.kind
+                    {
+                        text.push_str(thinking);
+                    }
+                }
+                Some("signature_delta") => {
+                    let index = event.get("index").and_then(Value::as_i64).unwrap_or(0);
+                    if let Some(signature_delta) = delta.get("signature").and_then(Value::as_str)
+                        && let Some(block) = state.thinking_blocks.get_mut(&index)
+                        && let AnthropicThinkingBlockKind::Thinking { signature, .. } =
+                            &mut block.kind
+                    {
+                        signature.push_str(signature_delta);
+                    }
+                }
                 _ => {}
             }
         }
         Some("content_block_stop") => {
             let index = event.get("index").and_then(Value::as_i64).unwrap_or(0);
-            if let Some(block) = state.tool_blocks.remove(&index) {
+            if let Some(block) = state.thinking_blocks.remove(&index) {
+                tx_event
+                    .send(Ok(ResponseEvent::OutputItemDone(anthropic_reasoning_item(
+                        block,
+                    ))))
+                    .await
+                    .map_err(|_| ())?;
+            } else if let Some(block) = state.tool_blocks.remove(&index) {
                 let arguments: Value = serde_json::from_str(&block.input_json)
                     .unwrap_or(Value::Object(Default::default()));
                 let item = match block.kind {
@@ -583,6 +775,7 @@ async fn process_anthropic_stream_event(
                 .send(Ok(ResponseEvent::Completed {
                     response_id,
                     token_usage: state.usage.clone(),
+                    end_turn: None,
                 }))
                 .await
                 .map_err(|_| ())?;
@@ -605,6 +798,41 @@ async fn process_anthropic_stream_event(
     Ok(())
 }
 
+fn anthropic_reasoning_item(block: AnthropicThinkingBlock) -> ResponseItem {
+    let metadata_block = match block.kind {
+        AnthropicThinkingBlockKind::Thinking {
+            thinking,
+            signature,
+        } => AnthropicThinkingMetadataBlock::Thinking {
+            thinking,
+            signature,
+        },
+        AnthropicThinkingBlockKind::RedactedThinking { data } => {
+            AnthropicThinkingMetadataBlock::RedactedThinking { data }
+        }
+    };
+    let summary = match &metadata_block {
+        AnthropicThinkingMetadataBlock::Thinking { thinking, .. } if !thinking.is_empty() => {
+            vec![ReasoningItemReasoningSummary::SummaryText {
+                text: thinking.clone(),
+            }]
+        }
+        _ => Vec::new(),
+    };
+    let metadata = AnthropicThinkingMetadata {
+        blocks: vec![metadata_block],
+    };
+    let encrypted_content = serde_json::to_string(&metadata)
+        .ok()
+        .map(|metadata| format!("{ANTHROPIC_THINKING_METADATA_PREFIX}{metadata}"));
+    ResponseItem::Reasoning {
+        id: "bedrock-claude-thinking".to_string(),
+        summary,
+        content: None,
+        encrypted_content,
+    }
+}
+
 async fn send_streaming_output_text_delta(
     tx_event: &mpsc::Sender<Result<ResponseEvent, ApiError>>,
     state: &mut AnthropicStreamState,
@@ -618,7 +846,6 @@ async fn send_streaming_output_text_delta(
             content: vec![ContentItem::OutputText {
                 text: String::new(),
             }],
-            end_turn: None,
             phase: None,
         };
         tx_event
@@ -646,7 +873,6 @@ async fn flush_streaming_output_text(
         content: vec![ContentItem::OutputText {
             text: std::mem::take(&mut state.output_text),
         }],
-        end_turn: None,
         phase: None,
     };
     state.text_open = false;
@@ -848,7 +1074,6 @@ mod tests {
                 content: vec![ContentItem::InputText {
                     text: "hello".to_string(),
                 }],
-                end_turn: None,
                 phase: None,
             }],
             tools,
@@ -908,6 +1133,68 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_request_body_marks_final_message_block_for_cache() {
+        let request = ResponsesApiRequest {
+            model: "global.anthropic.claude-opus-4-6-v1".to_string(),
+            instructions: String::new(),
+            input: vec![
+                ResponseItem::Message {
+                    id: None,
+                    role: "user".to_string(),
+                    content: vec![ContentItem::InputText {
+                        text: "large stable prompt".to_string(),
+                    }],
+                    phase: None,
+                },
+                ResponseItem::Message {
+                    id: None,
+                    role: "assistant".to_string(),
+                    content: vec![ContentItem::OutputText {
+                        text: "previous answer".to_string(),
+                    }],
+                    phase: None,
+                },
+                ResponseItem::Message {
+                    id: None,
+                    role: "user".to_string(),
+                    content: vec![ContentItem::InputText {
+                        text: "follow up".to_string(),
+                    }],
+                    phase: None,
+                },
+            ],
+            tools: Vec::new(),
+            tool_choice: "auto".to_string(),
+            parallel_tool_calls: true,
+            reasoning: None,
+            store: false,
+            stream: false,
+            include: Vec::new(),
+            service_tier: None,
+            prompt_cache_key: None,
+            text: None,
+            client_metadata: None,
+        };
+
+        let body = anthropic_request_body(&request);
+
+        assert_eq!(
+            body["messages"][2]["content"][0]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+        assert!(
+            body["messages"][0]["content"][0]
+                .get("cache_control")
+                .is_none()
+        );
+        assert!(
+            body["messages"][1]["content"][0]
+                .get("cache_control")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn anthropic_namespace_tools_use_canonical_display_names() {
         let tools = anthropic_tools(&[json!({
             "type": "namespace",
@@ -933,7 +1220,6 @@ mod tests {
                 content: vec![ContentItem::InputText {
                     text: "make a file".to_string(),
                 }],
-                end_turn: None,
                 phase: None,
             },
             ResponseItem::Message {
@@ -942,7 +1228,6 @@ mod tests {
                 content: vec![ContentItem::OutputText {
                     text: "I'll do that.".to_string(),
                 }],
-                end_turn: None,
                 phase: None,
             },
             ResponseItem::FunctionCall {
@@ -976,7 +1261,6 @@ mod tests {
                 content: vec![ContentItem::InputText {
                     text: "make a file".to_string(),
                 }],
-                end_turn: None,
                 phase: None,
             },
             ResponseItem::FunctionCall {
@@ -992,7 +1276,6 @@ mod tests {
                 content: vec![ContentItem::InputText {
                     text: "background context that arrived before the output".to_string(),
                 }],
-                end_turn: None,
                 phase: None,
             },
             ResponseItem::FunctionCallOutput {
@@ -1019,7 +1302,6 @@ mod tests {
                 content: vec![ContentItem::InputText {
                     text: "run something".to_string(),
                 }],
-                end_turn: None,
                 phase: None,
             },
             ResponseItem::FunctionCall {
@@ -1052,7 +1334,6 @@ mod tests {
                 content: vec![ContentItem::InputText {
                     text: "run two things".to_string(),
                 }],
-                end_turn: None,
                 phase: None,
             },
             ResponseItem::FunctionCall {
@@ -1087,6 +1368,47 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_messages_round_trips_thinking_blocks_before_tool_use() {
+        let reasoning_item = anthropic_reasoning_item(AnthropicThinkingBlock {
+            kind: AnthropicThinkingBlockKind::Thinking {
+                thinking: "Checking the plan.".to_string(),
+                signature: "sig_test".to_string(),
+            },
+        });
+
+        let messages = anthropic_messages(&[
+            ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "make a plan".to_string(),
+                }],
+                phase: None,
+            },
+            reasoning_item,
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "shell".to_string(),
+                namespace: None,
+                arguments: r#"{"cmd":"pwd"}"#.to_string(),
+                call_id: "toolu_thinking".to_string(),
+            },
+            ResponseItem::FunctionCallOutput {
+                call_id: "toolu_thinking".to_string(),
+                output: FunctionCallOutputPayload::from_text("ok".to_string()),
+            },
+        ]);
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"][0]["type"], "thinking");
+        assert_eq!(messages[1]["content"][0]["thinking"], "Checking the plan.");
+        assert_eq!(messages[1]["content"][0]["signature"], "sig_test");
+        assert_eq!(messages[1]["content"][1]["type"], "tool_use");
+        assert_eq!(messages[2]["content"][0]["type"], "tool_result");
+    }
+
+    #[test]
     fn anthropic_request_body_maps_reasoning_effort_to_adaptive_thinking() {
         let request = ResponsesApiRequest {
             model: "global.anthropic.claude-opus-4-6-v1".to_string(),
@@ -1097,7 +1419,6 @@ mod tests {
                 content: vec![ContentItem::InputText {
                     text: "think".to_string(),
                 }],
-                end_turn: None,
                 phase: None,
             }],
             tools: Vec::new(),
@@ -1123,6 +1444,18 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_model_match_rejects_unrelated_claude_substitution() {
+        assert!(anthropic_model_matches_requested(
+            "global.anthropic.claude-opus-4-6-v1",
+            "anthropic.claude-opus-4-6-v1"
+        ));
+        assert!(!anthropic_model_matches_requested(
+            "global.anthropic.claude-opus-4-6-v1",
+            "anthropic.claude-sonnet-4-5-v1"
+        ));
+    }
+
+    #[test]
     fn anthropic_usage_maps_prompt_cache_tokens() {
         let usage: TokenUsage = serde_json::from_value::<AnthropicUsage>(json!({
             "input_tokens": 50,
@@ -1137,6 +1470,106 @@ mod tests {
         assert_eq!(usage.cached_input_tokens, 1000);
         assert_eq!(usage.output_tokens, 25);
         assert_eq!(usage.total_tokens, 3075);
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_errors_when_response_model_differs() {
+        let (tx, mut rx) = mpsc::channel::<Result<ResponseEvent, ApiError>>(8);
+        let mut state = AnthropicStreamState {
+            requested_model: Some("global.anthropic.claude-opus-4-6-v1".to_string()),
+            ..Default::default()
+        };
+
+        let result = process_anthropic_stream_event(
+            &tx,
+            &mut state,
+            json!({
+                "type": "message_start",
+                "message": {
+                    "id": "msg_bedrock",
+                    "model": "anthropic.claude-sonnet-4-5-v1",
+                    "usage": {"input_tokens": 1, "output_tokens": 0}
+                }
+            }),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(state.completed);
+        let event = rx.recv().await.expect("event");
+        let Err(ApiError::Stream(message)) = event else {
+            panic!("expected stream error");
+        };
+        assert!(message.contains("claude-sonnet-4-5-v1"));
+        assert!(message.contains("claude-opus-4-6-v1"));
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_events_preserve_thinking_signature() {
+        let (tx, mut rx) = mpsc::channel::<Result<ResponseEvent, ApiError>>(8);
+        let mut state = AnthropicStreamState::default();
+
+        process_anthropic_stream_event(
+            &tx,
+            &mut state,
+            json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "thinking", "thinking": ""}
+            }),
+        )
+        .await
+        .unwrap();
+        process_anthropic_stream_event(
+            &tx,
+            &mut state,
+            json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "Checking docs."}
+            }),
+        )
+        .await
+        .unwrap();
+        process_anthropic_stream_event(
+            &tx,
+            &mut state,
+            json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "signature_delta", "signature": "sig_123"}
+            }),
+        )
+        .await
+        .unwrap();
+        process_anthropic_stream_event(
+            &tx,
+            &mut state,
+            json!({"type": "content_block_stop", "index": 0}),
+        )
+        .await
+        .unwrap();
+
+        let event = rx.recv().await.expect("event").expect("ok");
+        let ResponseEvent::OutputItemDone(ResponseItem::Reasoning {
+            summary,
+            encrypted_content,
+            ..
+        }) = event
+        else {
+            panic!("expected reasoning item");
+        };
+        assert_eq!(
+            summary,
+            vec![ReasoningItemReasoningSummary::SummaryText {
+                text: "Checking docs.".to_string()
+            }]
+        );
+        let blocks =
+            anthropic_reasoning_blocks(encrypted_content.as_deref()).expect("thinking blocks");
+        assert_eq!(blocks[0]["type"], "thinking");
+        assert_eq!(blocks[0]["thinking"], "Checking docs.");
+        assert_eq!(blocks[0]["signature"], "sig_123");
     }
 
     #[tokio::test]
@@ -1219,6 +1652,7 @@ mod tests {
             ResponseEvent::Completed {
                 response_id,
                 token_usage,
+                ..
             } => {
                 assert_eq!(response_id, "msg_bedrock");
                 let token_usage = token_usage.unwrap();

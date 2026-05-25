@@ -105,14 +105,21 @@ pub trait ModelsManager: fmt::Debug + Send + Sync {
     /// Return the auth manager used for picker filtering.
     fn auth_manager(&self) -> Option<&AuthManager>;
 
+    /// Return whether provider-local model slugs should be added to the picker.
+    fn include_local_provider_models(&self) -> bool {
+        false
+    }
+
     /// Build picker-ready presets from the active catalog snapshot.
     fn build_available_models(&self, mut remote_models: Vec<ModelInfo>) -> Vec<ModelPreset> {
-        for local_model in model_info::local_provider_models() {
-            if !remote_models
-                .iter()
-                .any(|remote_model| remote_model.slug == local_model.slug)
-            {
-                remote_models.push(local_model);
+        if self.include_local_provider_models() {
+            for local_model in model_info::local_provider_models() {
+                if !remote_models
+                    .iter()
+                    .any(|remote_model| remote_model.slug == local_model.slug)
+                {
+                    remote_models.push(local_model);
+                }
             }
         }
         remote_models.sort_by(|a, b| a.priority.cmp(&b.priority));
@@ -253,6 +260,10 @@ impl ModelsManager for OpenAiModelsManager {
 
     fn auth_manager(&self) -> Option<&AuthManager> {
         self.auth_manager.as_deref()
+    }
+
+    fn include_local_provider_models(&self) -> bool {
+        true
     }
 
     fn list_collaboration_modes(&self) -> Vec<CollaborationModeMask> {

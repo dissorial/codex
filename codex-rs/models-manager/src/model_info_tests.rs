@@ -17,6 +17,35 @@ fn bedrock_claude_opus_46_has_explicit_model_metadata() {
 }
 
 #[test]
+fn gemini_35_flash_has_explicit_model_metadata() {
+    let model = model_info_from_slug("gemini-3.5-flash");
+
+    assert_eq!(model.slug, "gemini-3.5-flash");
+    assert_eq!(model.display_name, "Gemini 3.5 Flash");
+    assert_eq!(model.context_window, Some(1_048_576));
+    assert_eq!(model.max_context_window, Some(1_048_576));
+    assert_eq!(model.default_reasoning_level, Some(ReasoningEffort::Medium));
+    assert_eq!(
+        model
+            .supported_reasoning_levels
+            .iter()
+            .map(|preset| preset.effort)
+            .collect::<Vec<_>>(),
+        vec![
+            ReasoningEffort::Minimal,
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+        ]
+    );
+    assert!(model.supports_reasoning_summaries);
+    assert!(model.supports_parallel_tool_calls);
+    assert!(model.supports_search_tool);
+    assert!(!model.used_fallback_model_metadata);
+    assert!(model.model_messages.is_none());
+}
+
+#[test]
 fn gemini_31_pro_customtools_has_explicit_model_metadata() {
     let model = model_info_from_slug("gemini-3.1-pro-preview-customtools");
 

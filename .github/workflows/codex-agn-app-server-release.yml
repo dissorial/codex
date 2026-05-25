@@ -1,0 +1,181 @@
+name: codex-agn-app-server-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: GitHub release tag to update.
+        required: false
+        default: codex-agn-app-server-latest
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}::${{ inputs.release_tag || 'codex-agn-app-server-latest' }}
+  cancel-in-progress: true
+
+jobs:
+  build-linux:
+    name: Build Linux app-server
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: codex-rs
+    env:
+      BUILD_PROFILE: sandbox-release
+      TARGET: x86_64-unknown-linux-gnu
+      ASSET_NAME: codex-app-server-x86_64-unknown-linux-gnu
+      CLI_ASSET_NAME: codex-x86_64-unknown-linux-gnu
+      RUNTIME_BUNDLE_NAME: codex-runtime-linux-x64.tar.zst
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Install Linux build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            libcap-dev \
+            pkg-config \
+            zstd
+
+      - uses: dtolnay/rust-toolchain@a0b273b48ed29de4470960879e8381ff45632f26
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cache Cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            codex-rs/target
+          key: codex-agn-app-server-${{ runner.os }}-${{ env.TARGET }}-${{ hashFiles('codex-rs/Cargo.lock', 'codex-rs/Cargo.toml') }}
+          restore-keys: |
+            codex-agn-app-server-${{ runner.os }}-${{ env.TARGET }}-
+
+      - name: Build app-server
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --target "${TARGET}" --profile "${BUILD_PROFILE}" \
+            -p codex-app-server --bin codex-app-server \
+            -p codex-cli --bin codex
+
+      - name: Stage release asset
+        id: stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          out_dir="${RUNNER_TEMP}/codex-agn-app-server"
+          mkdir -p "${out_dir}"
+          cp "target/${TARGET}/${BUILD_PROFILE}/codex-app-server" "${out_dir}/${ASSET_NAME}"
+          cp "target/${TARGET}/${BUILD_PROFILE}/codex" "${out_dir}/${CLI_ASSET_NAME}"
+          chmod +x "${out_dir}/${ASSET_NAME}"
+          chmod +x "${out_dir}/${CLI_ASSET_NAME}"
+          (cd "${out_dir}" && sha256sum "${ASSET_NAME}" > "${ASSET_NAME}.sha256")
+          (cd "${out_dir}" && sha256sum "${CLI_ASSET_NAME}" > "${CLI_ASSET_NAME}.sha256")
+          app_server_sha256="$(awk '{print $1}' "${out_dir}/${ASSET_NAME}.sha256")"
+          cli_sha256="$(awk '{print $1}' "${out_dir}/${CLI_ASSET_NAME}.sha256")"
+          runtime_dir="${out_dir}/runtime"
+          mkdir -p "${runtime_dir}/bin"
+          cp "${out_dir}/${ASSET_NAME}" "${runtime_dir}/bin/codex-app-server"
+          cp "${out_dir}/${CLI_ASSET_NAME}" "${runtime_dir}/bin/codex"
+          chmod +x "${runtime_dir}/bin/codex-app-server" "${runtime_dir}/bin/codex"
+          cat >"${runtime_dir}/manifest.json" <<EOF
+          {
+            "schemaVersion": 1,
+            "version": "${GITHUB_SHA}",
+            "target": "${TARGET}",
+            "buildProfile": "${BUILD_PROFILE}",
+            "binaries": {
+              "codex-app-server": {
+                "path": "bin/codex-app-server",
+                "sha256": "${app_server_sha256}"
+              },
+              "codex": {
+                "path": "bin/codex",
+                "sha256": "${cli_sha256}"
+              }
+            }
+          }
+          EOF
+          tar --zstd -cf "${out_dir}/${RUNTIME_BUNDLE_NAME}" -C "${runtime_dir}" .
+          (cd "${out_dir}" && sha256sum "${RUNTIME_BUNDLE_NAME}" > "${RUNTIME_BUNDLE_NAME}.sha256")
+          echo "asset_path=${out_dir}/${ASSET_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "checksum_path=${out_dir}/${ASSET_NAME}.sha256" >> "${GITHUB_OUTPUT}"
+          echo "cli_asset_path=${out_dir}/${CLI_ASSET_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "cli_checksum_path=${out_dir}/${CLI_ASSET_NAME}.sha256" >> "${GITHUB_OUTPUT}"
+          echo "runtime_bundle_path=${out_dir}/${RUNTIME_BUNDLE_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "runtime_bundle_checksum_path=${out_dir}/${RUNTIME_BUNDLE_NAME}.sha256" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: ${{ env.ASSET_NAME }}
+          path: |
+            ${{ steps.stage.outputs.asset_path }}
+            ${{ steps.stage.outputs.checksum_path }}
+            ${{ steps.stage.outputs.cli_asset_path }}
+            ${{ steps.stage.outputs.cli_checksum_path }}
+            ${{ steps.stage.outputs.runtime_bundle_path }}
+            ${{ steps.stage.outputs.runtime_bundle_checksum_path }}
+          if-no-files-found: error
+
+      - name: Publish GitHub release asset
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag || 'codex-agn-app-server-latest' }}
+          ASSET_PATH: ${{ steps.stage.outputs.asset_path }}
+          CHECKSUM_PATH: ${{ steps.stage.outputs.checksum_path }}
+          CLI_ASSET_PATH: ${{ steps.stage.outputs.cli_asset_path }}
+          CLI_CHECKSUM_PATH: ${{ steps.stage.outputs.cli_checksum_path }}
+          RUNTIME_BUNDLE_PATH: ${{ steps.stage.outputs.runtime_bundle_path }}
+          RUNTIME_BUNDLE_CHECKSUM_PATH: ${{ steps.stage.outputs.runtime_bundle_checksum_path }}
+        run: |
+          set -euo pipefail
+          repo="${GITHUB_REPOSITORY}"
+          title="codex-agn app-server latest"
+          notes="Linux app-server build for codex-agn from ${GITHUB_SHA}."
+
+          if ! gh release view "${RELEASE_TAG}" --repo "${repo}" >/dev/null 2>&1; then
+            gh release create "${RELEASE_TAG}" \
+              --repo "${repo}" \
+              --title "${title}" \
+              --notes "${notes}" \
+              --prerelease \
+              --target "${GITHUB_SHA}"
+          fi
+
+          gh release upload "${RELEASE_TAG}" \
+            --repo "${repo}" \
+            --clobber \
+            "${ASSET_PATH}" \
+            "${CHECKSUM_PATH}" \
+            "${CLI_ASSET_PATH}" \
+            "${CLI_CHECKSUM_PATH}" \
+            "${RUNTIME_BUNDLE_PATH}" \
+            "${RUNTIME_BUNDLE_CHECKSUM_PATH}"
+
+          {
+            echo "### codex-agn app-server release"
+            echo
+            echo "Tag: \`${RELEASE_TAG}\`"
+            echo
+            echo "Asset URL:"
+            echo
+            echo "\`https://github.com/${repo}/releases/download/${RELEASE_TAG}/${ASSET_NAME}\`"
+            echo
+            echo "CLI asset URL:"
+            echo
+            echo "\`https://github.com/${repo}/releases/download/${RELEASE_TAG}/${CLI_ASSET_NAME}\`"
+            echo
+            echo "Runtime bundle URL:"
+            echo
+            echo "\`https://github.com/${repo}/releases/download/${RELEASE_TAG}/${RUNTIME_BUNDLE_NAME}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"

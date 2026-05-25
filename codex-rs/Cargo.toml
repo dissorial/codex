@@ -501,6 +501,15 @@ strip = "symbols"
 # See https://github.com/openai/codex/issues/1411 for details.
 codegen-units = 1
 
+[profile.sandbox-release]
+inherits = "release"
+# Keep Delegento E2B runtime artifacts optimized and stripped without the memory
+# pressure of the full release profile's fat LTO/codegen settings in CI.
+lto = false
+codegen-units = 16
+opt-level = 3
+strip = "symbols"
+
 [profile.profiling]
 inherits = "release"
 debug = "full"

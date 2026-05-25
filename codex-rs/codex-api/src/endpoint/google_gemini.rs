@@ -57,7 +57,9 @@ fn gemini_request_body(request: &ResponsesApiRequest) -> Value {
     let uses_web_search = request.tools.iter().any(is_web_search_tool);
     let mut generation_config = Map::new();
     generation_config.insert("maxOutputTokens".to_string(), json!(MAX_OUTPUT_TOKENS));
-    if let Some(thinking_config) = gemini_thinking_config(request.reasoning.as_ref()) {
+    if let Some(thinking_config) =
+        gemini_thinking_config(&request.model, request.reasoning.as_ref())
+    {
         generation_config.insert("thinkingConfig".to_string(), thinking_config);
     }
     json!({
@@ -84,10 +86,10 @@ fn gemini_text_parts(text: &str) -> Vec<Value> {
     }
 }
 
-fn gemini_thinking_config(reasoning: Option<&Reasoning>) -> Option<Value> {
+fn gemini_thinking_config(model: &str, reasoning: Option<&Reasoning>) -> Option<Value> {
     let reasoning = reasoning?;
     let mut thinking_config = Map::new();
-    if let Some(thinking_level) = gemini_thinking_level(reasoning.effort) {
+    if let Some(thinking_level) = gemini_thinking_level(model, reasoning.effort) {
         thinking_config.insert(
             "thinkingLevel".to_string(),
             Value::String(thinking_level.to_string()),
@@ -106,13 +108,20 @@ fn gemini_thinking_config(reasoning: Option<&Reasoning>) -> Option<Value> {
     }
 }
 
-fn gemini_thinking_level(effort: Option<ReasoningEffort>) -> Option<&'static str> {
+fn gemini_thinking_level(model: &str, effort: Option<ReasoningEffort>) -> Option<&'static str> {
     match effort {
+        Some(ReasoningEffort::Minimal) if gemini_supports_minimal_thinking(model) => {
+            Some("minimal")
+        }
         Some(ReasoningEffort::Low) => Some("low"),
         Some(ReasoningEffort::Medium) => Some("medium"),
         Some(ReasoningEffort::High | ReasoningEffort::XHigh) => Some("high"),
         Some(ReasoningEffort::None | ReasoningEffort::Minimal) | None => None,
     }
+}
+
+fn gemini_supports_minimal_thinking(model: &str) -> bool {
+    matches!(model, "gemini-3.5-flash")
 }
 
 fn gemini_contents(items: &[ResponseItem]) -> Vec<Value> {
@@ -631,10 +640,14 @@ fn response_stream_from_sse(bytes: codex_client::ByteStream) -> ResponseStream {
                     .response_id
                     .unwrap_or_else(|| "gemini-response".to_string()),
                 token_usage: state.usage_metadata.map(Into::into),
+                end_turn: None,
             }))
             .await;
     });
-    ResponseStream { rx_event }
+    ResponseStream {
+        rx_event,
+        upstream_request_id: None,
+    }
 }
 
 #[derive(Default)]
@@ -810,7 +823,6 @@ async fn send_gemini_streaming_output_text_delta(
             content: vec![ContentItem::OutputText {
                 text: String::new(),
             }],
-            end_turn: None,
             phase: None,
         };
         tx_event
@@ -857,7 +869,6 @@ async fn flush_gemini_streaming_output_text(
         id: Some(format!("gemini-message-{}", state.text_block_index)),
         role: "assistant".to_string(),
         content: vec![ContentItem::OutputText { text }],
-        end_turn: None,
         phase: None,
     };
     state.text_open = false;
@@ -1092,7 +1103,6 @@ mod tests {
                 content: vec![ContentItem::InputText {
                     text: "make a file".to_string(),
                 }],
-                end_turn: None,
                 phase: None,
             },
             ResponseItem::Reasoning {
@@ -1271,6 +1281,36 @@ mod tests {
         let body = gemini_request_body(&request);
 
         assert!(body["generationConfig"].get("thinkingConfig").is_none());
+    }
+
+    #[test]
+    fn gemini_request_body_maps_supported_minimal_thinking_level() {
+        let request = ResponsesApiRequest {
+            model: "gemini-3.5-flash".to_string(),
+            instructions: String::new(),
+            input: Vec::new(),
+            tools: Vec::new(),
+            tool_choice: "auto".to_string(),
+            parallel_tool_calls: true,
+            reasoning: Some(Reasoning {
+                effort: Some(ReasoningEffort::Minimal),
+                summary: None,
+            }),
+            store: false,
+            stream: true,
+            include: Vec::new(),
+            service_tier: None,
+            prompt_cache_key: None,
+            text: None,
+            client_metadata: None,
+        };
+
+        let body = gemini_request_body(&request);
+
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "minimal"
+        );
     }
 
     #[tokio::test]
