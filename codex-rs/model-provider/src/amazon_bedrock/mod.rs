@@ -62,7 +62,7 @@ impl ModelProvider for AmazonBedrockModelProvider {
 
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
-            namespace_tools: false,
+            namespace_tools: self.info.is_amazon_bedrock_claude(),
             image_generation: false,
             web_search: false,
         }
@@ -155,6 +155,22 @@ mod tests {
             provider.capabilities(),
             ProviderCapabilities {
                 namespace_tools: false,
+                image_generation: false,
+                web_search: false,
+            }
+        );
+    }
+
+    #[test]
+    fn claude_provider_enables_namespace_tools() {
+        let provider = AmazonBedrockModelProvider::new(
+            ModelProviderInfo::create_amazon_bedrock_claude_provider(/*aws*/ None),
+        );
+
+        assert_eq!(
+            provider.capabilities(),
+            ProviderCapabilities {
+                namespace_tools: true,
                 image_generation: false,
                 web_search: false,
             }

@@ -6,6 +6,7 @@ use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_mcp::ToolInfo;
 use codex_model_provider::create_model_provider;
+use codex_model_provider_info::AMAZON_BEDROCK_CLAUDE_PROVIDER_ID;
 use codex_model_provider_info::AMAZON_BEDROCK_PROVIDER_ID;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_protocol::config_types::WebSearchMode;
@@ -253,6 +254,15 @@ fn use_bedrock_provider(turn: &mut TurnContext) {
     turn.provider = create_model_provider(provider_info, turn.auth_manager.clone());
 }
 
+fn use_bedrock_claude_provider(turn: &mut TurnContext) {
+    let provider_info = ModelProviderInfo::create_amazon_bedrock_claude_provider(/*aws*/ None);
+    update_config(turn, |config| {
+        config.model_provider_id = AMAZON_BEDROCK_CLAUDE_PROVIDER_ID.to_string();
+        config.model_provider = provider_info.clone();
+    });
+    turn.provider = create_model_provider(provider_info, turn.auth_manager.clone());
+}
+
 fn duplicate_primary_environment(turn: &mut TurnContext) {
     let mut second_environment = turn.environments.turn_environments[0].clone();
     second_environment.environment_id = "secondary".to_string();
@@ -460,6 +470,38 @@ async fn mcp_and_tool_search_follow_direct_and_deferred_tool_exposure() {
     assert_eq!(
         direct_mcp.namespace_function_names("mcp__direct__"),
         &["lookup".to_string()]
+    );
+
+    let direct_mcp_missing_namespace_capability = probe_with(
+        |turn| {
+            use_bedrock_provider(turn);
+        },
+        ToolPlanInputs {
+            mcp_tools: Some(vec![mcp_tool("direct", "mcp__direct__", "lookup")]),
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+    direct_mcp_missing_namespace_capability.assert_visible_lacks(&["mcp__direct__"]);
+    direct_mcp_missing_namespace_capability.assert_registered_contains(&["mcp__direct__lookup"]);
+
+    let direct_mcp_bedrock_claude = probe_with(
+        |turn| {
+            use_bedrock_claude_provider(turn);
+        },
+        ToolPlanInputs {
+            mcp_tools: Some(vec![mcp_tool(
+                "delegento",
+                "mcp__delegento__",
+                "list_available_integrations",
+            )]),
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        direct_mcp_bedrock_claude.namespace_function_names("mcp__delegento__"),
+        &["list_available_integrations".to_string()]
     );
 
     let searchable_mcp = ToolPlanInputs {

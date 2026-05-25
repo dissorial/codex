@@ -3467,6 +3467,13 @@ impl codex_thread_store::ThreadStore for CountingThreadStore {
         unimplemented!("not needed for shutdown persistence regression test")
     }
 
+    async fn read_thread_by_rollout_path(
+        &self,
+        _params: codex_thread_store::ReadThreadByRolloutPathParams,
+    ) -> codex_thread_store::ThreadStoreResult<codex_thread_store::StoredThread> {
+        unimplemented!("not needed for shutdown persistence regression test")
+    }
+
     async fn list_threads(
         &self,
         _params: codex_thread_store::ListThreadsParams,
@@ -3506,8 +3513,14 @@ async fn shutdown_complete_is_delivered_after_thread_persistence_shutdown_withou
             thread_id: session.conversation_id,
             forked_from_id: None,
             source: SessionSource::Exec,
+            thread_source: None,
             base_instructions: BaseInstructions::default(),
             dynamic_tools: Vec::new(),
+            metadata: ThreadPersistenceMetadata {
+                cwd: None,
+                memory_mode: ThreadMemoryMode::Disabled,
+                model_provider: "test-provider".to_string(),
+            },
             event_persistence_mode: ThreadEventPersistenceMode::Limited,
         },
     )
